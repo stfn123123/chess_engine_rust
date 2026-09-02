@@ -185,43 +185,50 @@ impl Move {
     }
 }
 
-// two positions are the same position for the repetition rule when the pieces, the
-// side to move, the castling rights and the en passant option all match
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct PositionKey {
-    square: [Option<Piece>; 64],
-    turn: Color,
-    castling_rights: CastlingRights,
-    en_passant_target: Option<u8>,
-}
-
 pub struct Board {
     turn: Color,
     square: [Option<Piece>; 64],
     moves: Vec<Move>,
-    // the position before each move on the move stack, so index i belongs to moves[i]
-    position_history: Vec<PositionKey>,
+    // the zobrist hash of the position before each move on the move stack,
+    // so index i belongs to moves[i]
+    position_history: Vec<u64>,
     castling_rights: CastlingRights,
     // the square a pawn skipped over with its double push, i.e. the square an enemy
     // pawn may capture onto right now - only valid for the immediately following move
     en_passant_target: Option<u8>,
+    // the zobrist hash of the current position: pieces, side to move, castling rights
+    // and the en passant option, kept up to date move by move instead of recomputed
+    hash: u64,
+    // the en passant key that is currently mixed into `hash`, 0 when there is none
+    // remembered because whether a target is capturable can change with the position
+    en_passant_hash: u64,
 }
 
 // -------------------- public API --------------------
 impl Board {
     pub fn new() -> Board {
+        let castling_rights = CastlingRights::ALL;
+
         Board {
             turn: Color::White,
             square: [None; 64],
             moves: Vec::new(),
             position_history: Vec::new(),
-            castling_rights: CastlingRights::ALL,
+            castling_rights,
             en_passant_target: None,
+            // white to move and no en passant target contribute nothing
+            hash: castling_hash(castling_rights),
+            en_passant_hash: 0,
         }
     }
 
     pub fn turn(&self) -> Color {
         self.turn
+    }
+
+    // the zobrist hash of the current position
+    pub fn hash(&self) -> u64 {
+        self.hash
     }
 
     pub fn castling_rights(&self) -> CastlingRights {
@@ -233,7 +240,7 @@ impl Board {
     }
 
     pub fn add_piece(&mut self, piece: Piece, position: u8) {
-        self.square[position as usize] = Some(piece);
+        self.set_square(position, Some(piece));
     }
 
     pub fn create_basic_layout(&mut self) {
@@ -258,8 +265,8 @@ impl Board {
             self.add_piece(Piece::new(PieceType::Pawn, Color::Black), 48 + file);
         }
 
-        self.castling_rights = CastlingRights::ALL;
-        self.en_passant_target = None;
+        self.set_castling_rights(CastlingRights::ALL);
+        self.set_en_passant_target(None);
     }
 
     pub fn display(&self) {
@@ -286,7 +293,7 @@ impl Board {
     // a pawn moving diagonally onto an empty square is taken as an en passant capture
     pub fn create_move(&mut self, from: u8, to: u8, promotion: Option<PieceType>) {
         // has to happen before anything is changed: this records the position as it was
-        self.position_history.push(self.position_key());
+        self.position_history.push(self.hash);
 
         let piece = self.square[from as usize].expect("no piece on the from square");
         let is_king = piece.piece_type() == PieceType::King as u8;
@@ -296,7 +303,7 @@ impl Board {
         let captured = if en_passant {
             let captured_square = en_passant_captured_square(to, piece.color());
             let captured_pawn = self.square[captured_square as usize];
-            self.square[captured_square as usize] = None;
+            self.set_square(captured_square, None);
             captured_pawn
         } else {
             self.square[to as usize]
@@ -319,34 +326,32 @@ impl Board {
         };
 
         // the pawn only reaches the board as its promoted piece, the Move keeps the pawn
-        self.square[to as usize] = Some(match promotion {
+        let arriving = match promotion {
             Some(piece_type) => Piece::new(piece_type, piece.color()),
             None => piece,
-        });
-        self.square[from as usize] = None;
+        };
+        self.set_square(to, Some(arriving));
+        self.set_square(from, None);
 
         if let Some(side) = castle {
             let rook_from = rook_start_square(piece.color(), side);
             let rook_to = rook_castle_square(piece.color(), side);
-            self.square[rook_to as usize] = self.square[rook_from as usize];
-            self.square[rook_from as usize] = None;
+            let rook = self.square[rook_from as usize];
+            self.set_square(rook_to, rook);
+            self.set_square(rook_from, None);
         }
 
         let castling_rights_before = self.castling_rights;
+        let mut castling_rights = self.castling_rights;
         if is_king {
-            self.castling_rights.clear_color(piece.color());
+            castling_rights.clear_color(piece.color());
         }
         // covers both a rook leaving its start square and a rook being captured on it
-        self.clear_castling_rights_on(from);
-        self.clear_castling_rights_on(to);
+        clear_castling_rights_on(&mut castling_rights, from);
+        clear_castling_rights_on(&mut castling_rights, to);
+        self.set_castling_rights(castling_rights);
 
-        // only a double push opens an en passant target, every other move closes it
         let en_passant_before = self.en_passant_target;
-        self.en_passant_target = if is_pawn && (to as i8 - from as i8).abs() == 16 {
-            Some((from + to) / 2)
-        } else {
-            None
-        };
 
         self.moves.push(Move {
             from,
@@ -359,7 +364,19 @@ impl Board {
             castling_rights_before,
             en_passant_before,
         });
-        self.turn = self.turn.opponent();
+        self.flip_turn();
+
+        // last, because whether the target is capturable depends on the finished
+        // position and on the side that is to move now
+        // only a double push opens a target, every other move closes it
+        let target = if is_pawn && (to as i8 - from as i8).abs() == 16 {
+            Some((from + to) / 2)
+        } else {
+            None
+        };
+        self.set_en_passant_target(target);
+
+        debug_assert_eq!(self.hash, self.full_hash(), "incremental hash drifted");
     }
 
     // undoes the last move (pop from the stack, restore the captured piece and the
@@ -371,26 +388,31 @@ impl Board {
         // moves and position_history are pushed together and have to stay the same length
         self.position_history.pop();
 
-        self.square[last_move.from as usize] = Some(last_move.piece);
+        self.set_square(last_move.from, Some(last_move.piece));
         if last_move.en_passant {
             // the captured pawn never stood on `to`
             let captured_square = en_passant_captured_square(last_move.to, last_move.piece.color());
-            self.square[last_move.to as usize] = None;
-            self.square[captured_square as usize] = last_move.captured;
+            self.set_square(last_move.to, None);
+            self.set_square(captured_square, last_move.captured);
         } else {
-            self.square[last_move.to as usize] = last_move.captured;
+            self.set_square(last_move.to, last_move.captured);
         }
 
         if let Some(side) = last_move.castle {
             let rook_from = rook_start_square(last_move.piece.color(), side);
             let rook_to = rook_castle_square(last_move.piece.color(), side);
-            self.square[rook_from as usize] = self.square[rook_to as usize];
-            self.square[rook_to as usize] = None;
+            let rook = self.square[rook_to as usize];
+            self.set_square(rook_from, rook);
+            self.set_square(rook_to, None);
         }
 
-        self.castling_rights = last_move.castling_rights_before;
-        self.en_passant_target = last_move.en_passant_before;
-        self.turn = self.turn.opponent();
+        self.set_castling_rights(last_move.castling_rights_before);
+        self.flip_turn();
+        // same as in create_move: the target is restored last, once the position and
+        // the side to move are back to what they were
+        self.set_en_passant_target(last_move.en_passant_before);
+
+        debug_assert_eq!(self.hash, self.full_hash(), "incremental hash drifted");
 
         Some(last_move)
     }
@@ -441,7 +463,7 @@ impl Board {
 
     // how often the current position has occurred in this game, the current one included
     pub fn position_repetitions(&self) -> usize {
-        let current = self.position_key();
+        let current = self.hash;
         let mut repetitions = 1;
 
         // walking backwards only until the last capture or pawn move is enough:
@@ -493,14 +515,69 @@ impl Board {
 
 // -------------------- private helpers --------------------
 impl Board {
-    // helper: everything that has to match for two positions to count as the same one
-    fn position_key(&self) -> PositionKey {
-        PositionKey {
-            square: self.square,
-            turn: self.turn,
-            castling_rights: self.castling_rights,
-            en_passant_target: self.capturable_en_passant_target(),
+    // helper: every write to a square goes through here, so that the hash stays in sync
+    // with the board - xor is its own inverse, so taking a piece off a square is the
+    // same operation as putting it there
+    fn set_square(&mut self, position: u8, piece: Option<Piece>) {
+        if let Some(previous) = self.square[position as usize] {
+            self.hash ^= ZOBRIST.pieces[position as usize][previous.0 as usize];
         }
+        if let Some(piece) = piece {
+            self.hash ^= ZOBRIST.pieces[position as usize][piece.0 as usize];
+        }
+
+        self.square[position as usize] = piece;
+    }
+
+    // helper: the side to move key is mixed in exactly while black is to move
+    fn flip_turn(&mut self) {
+        self.turn = self.turn.opponent();
+        self.hash ^= ZOBRIST.side_to_move;
+    }
+
+    // helper: swaps the castling keys of the old rights for those of the new ones
+    fn set_castling_rights(&mut self, castling_rights: CastlingRights) {
+        self.hash ^= castling_hash(self.castling_rights) ^ castling_hash(castling_rights);
+        self.castling_rights = castling_rights;
+    }
+
+    // helper: only the file of the target is hashed, and only while the side to move
+    // can really capture onto it - two positions that differ in an unusable target are
+    // the same position, so they have to get the same hash
+    // call this only once the position and the side to move are final
+    fn set_en_passant_target(&mut self, target: Option<u8>) {
+        self.en_passant_target = target;
+
+        let en_passant_hash = match self.capturable_en_passant_target() {
+            Some(square) => ZOBRIST.en_passant_file[(square % 8) as usize],
+            None => 0,
+        };
+
+        self.hash ^= self.en_passant_hash ^ en_passant_hash;
+        self.en_passant_hash = en_passant_hash;
+    }
+
+    // helper: the hash of the current position computed from scratch
+    // the incrementally updated hash has to match this at all times, which is what the
+    // debug_assert in create_move/undo_move checks
+    fn full_hash(&self) -> u64 {
+        let mut hash = castling_hash(self.castling_rights);
+
+        for (position, square) in self.square.iter().enumerate() {
+            if let Some(piece) = square {
+                hash ^= ZOBRIST.pieces[position][piece.0 as usize];
+            }
+        }
+
+        if self.turn == Color::Black {
+            hash ^= ZOBRIST.side_to_move;
+        }
+
+        if let Some(target) = self.capturable_en_passant_target() {
+            hash ^= ZOBRIST.en_passant_file[(target % 8) as usize];
+        }
+
+        hash
     }
 
     // helper: the en passant target, but only while the side to move can really take it
@@ -639,17 +716,6 @@ impl Board {
         false
     }
 
-    // helper: a rook that leaves its start square, or gets captured on it, ends that castling side
-    fn clear_castling_rights_on(&mut self, position: u8) {
-        for color in [Color::White, Color::Black] {
-            for side in [CastleSide::King, CastleSide::Queen] {
-                if rook_start_square(color, side) == position {
-                    self.castling_rights.clear(color, side);
-                }
-            }
-        }
-    }
-
     // helper: pseudo-legal moves of both sides (simply call pseudo_moves_for_color twice)
     #[allow(dead_code)]
     fn pseudo_moves_all(&self) -> Vec<Move> {
@@ -777,12 +843,12 @@ impl Board {
 
     // helper: diagonal sliding moves (bishop/queen)
     fn pseudo_moves_diagonal(&self, piece: Piece, position: u8) -> Vec<Move> {
-        self.pseudo_moves_sliding(piece, position, &[(1, 1), (1, -1), (-1, 1), (-1, -1)])
+        self.pseudo_moves_sliding(piece, position, &DIAGONAL_DIRECTIONS)
     }
 
     // helper: horizontal + vertical sliding moves (rook/queen)
     fn pseudo_moves_straight(&self, piece: Piece, position: u8) -> Vec<Move> {
-        self.pseudo_moves_sliding(piece, position, &[(1, 0), (-1, 0), (0, 1), (0, -1)])
+        self.pseudo_moves_sliding(piece, position, &STRAIGHT_DIRECTIONS)
     }
 
     // helper: walks in each given (file_step, rank_step) direction until the edge of the board,
@@ -818,7 +884,6 @@ impl Board {
     }
 
     // helper
-    // note: en passant not handled yet
     fn pseudo_moves_pawn(&self, position: u8) -> Vec<Move> {
         let piece = match self.get_piece(position) {
             Some(piece) => piece,
@@ -827,9 +892,10 @@ impl Board {
 
         let file = (position % 8) as i8;
         let rank = (position / 8) as i8;
-        let (direction, start_rank): (i8, i8) = match piece.color() {
-            Color::White => (1, 1),
-            Color::Black => (-1, 6),
+        let direction = pawn_direction(piece.color());
+        let start_rank: i8 = match piece.color() {
+            Color::White => 1,
+            Color::Black => 6,
         };
 
         let mut moves = Vec::new();
@@ -886,18 +952,7 @@ impl Board {
             None => return Vec::new(),
         };
 
-        let offsets = [
-            (1, 0),
-            (1, 1),
-            (0, 1),
-            (-1, 1),
-            (-1, 0),
-            (-1, -1),
-            (0, -1),
-            (1, -1),
-        ];
-
-        self.pseudo_moves_stepping(piece, position, &offsets)
+        self.pseudo_moves_stepping(piece, position, &KING_OFFSETS)
     }
 
     // helper
@@ -907,18 +962,7 @@ impl Board {
             None => return Vec::new(),
         };
 
-        let offsets = [
-            (1, 2),
-            (2, 1),
-            (2, -1),
-            (1, -2),
-            (-1, -2),
-            (-2, -1),
-            (-2, 1),
-            (-1, 2),
-        ];
-
-        self.pseudo_moves_stepping(piece, position, &offsets)
+        self.pseudo_moves_stepping(piece, position, &KNIGHT_OFFSETS)
     }
 
     // helper: applies each (file_offset, rank_offset) once (no sliding) - shared by knight/king
@@ -948,6 +992,41 @@ impl Board {
     }
 }
 
+// (file_offset, rank_offset) tables, shared by the move generators and the attack scan
+const KING_OFFSETS: [(i8, i8); 8] = [
+    (1, 0),
+    (1, 1),
+    (0, 1),
+    (-1, 1),
+    (-1, 0),
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+];
+
+const KNIGHT_OFFSETS: [(i8, i8); 8] = [
+    (1, 2),
+    (2, 1),
+    (2, -1),
+    (1, -2),
+    (-1, -2),
+    (-2, -1),
+    (-2, 1),
+    (-1, 2),
+];
+
+const DIAGONAL_DIRECTIONS: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+
+const STRAIGHT_DIRECTIONS: [(i8, i8); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+
+// helper: the rank step a pawn of that color moves in
+fn pawn_direction(color: Color) -> i8 {
+    match color {
+        Color::White => 1,
+        Color::Black => -1,
+    }
+}
+
 // a pawn may become any of these
 const PROMOTION_CHOICES: [PieceType; 4] = [
     PieceType::Queen,
@@ -955,6 +1034,111 @@ const PROMOTION_CHOICES: [PieceType; 4] = [
     PieceType::Bishop,
     PieceType::Knight,
 ];
+
+// -------------------- zobrist keys --------------------
+// one random number per (square, piece), plus one for black to move, one per castling
+// side and one per en passant file - the hash of a position is all of them xored
+// together, which is why a move only has to xor the few keys that actually changed
+
+// a Piece is `piece_type | color`, so the biggest value is Queen | Black = 6 | 16 = 22
+// using Piece.0 directly as the index costs a few unused rows and saves a mapping
+const PIECE_KEY_COUNT: usize = 23;
+
+struct Zobrist {
+    pieces: [[u64; PIECE_KEY_COUNT]; 64],
+    side_to_move: u64,
+    castling: [u64; 4],
+    en_passant_file: [u64; 8],
+}
+
+// the keys have to be the same on every run, so they are built at compile time
+static ZOBRIST: Zobrist = build_zobrist();
+
+const ZOBRIST_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+// xorshift64*, good enough for table keys and simple enough to run in a const fn
+const fn next_state(state: u64) -> u64 {
+    let mut state = state;
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    state
+}
+
+const fn random_from(state: u64) -> u64 {
+    state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+const fn build_zobrist() -> Zobrist {
+    let mut pieces = [[0u64; PIECE_KEY_COUNT]; 64];
+    let mut castling = [0u64; 4];
+    let mut en_passant_file = [0u64; 8];
+    let mut state = ZOBRIST_SEED;
+
+    // const fn has no for loops, hence the while loops
+    let mut square = 0;
+    while square < 64 {
+        let mut piece = 0;
+        while piece < PIECE_KEY_COUNT {
+            state = next_state(state);
+            pieces[square][piece] = random_from(state);
+            piece += 1;
+        }
+        square += 1;
+    }
+
+    let mut index = 0;
+    while index < 4 {
+        state = next_state(state);
+        castling[index] = random_from(state);
+        index += 1;
+    }
+
+    let mut file = 0;
+    while file < 8 {
+        state = next_state(state);
+        en_passant_file[file] = random_from(state);
+        file += 1;
+    }
+
+    state = next_state(state);
+    let side_to_move = random_from(state);
+
+    Zobrist {
+        pieces,
+        side_to_move,
+        castling,
+        en_passant_file,
+    }
+}
+
+// helper: a rook that leaves its start square, or gets captured on it, ends that castling side
+fn clear_castling_rights_on(castling_rights: &mut CastlingRights, position: u8) {
+    for color in [Color::White, Color::Black] {
+        for side in [CastleSide::King, CastleSide::Queen] {
+            if rook_start_square(color, side) == position {
+                castling_rights.clear(color, side);
+            }
+        }
+    }
+}
+
+// helper: the keys of all castling sides that are still open
+fn castling_hash(castling_rights: CastlingRights) -> u64 {
+    let mut hash = 0;
+    let mut index = 0;
+
+    for color in [Color::White, Color::Black] {
+        for side in [CastleSide::King, CastleSide::Queen] {
+            if castling_rights.get(color, side) {
+                hash ^= ZOBRIST.castling[index];
+            }
+            index += 1;
+        }
+    }
+
+    hash
+}
 
 // helper: a move after which no earlier position can ever show up again
 // (the same rule the 50-move counter resets on)
