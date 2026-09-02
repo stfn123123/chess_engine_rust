@@ -269,6 +269,7 @@ impl Board {
         self.set_en_passant_target(None);
     }
 
+    #[allow(dead_code)]
     pub fn display(&self) {
         for rank in (0..8).rev() {
             for file in 0..8 {
