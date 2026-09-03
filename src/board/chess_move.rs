@@ -1,0 +1,85 @@
+// A move, and what the board has to remember to be able to take it back.
+//
+// A Move describes the move itself and nothing about the position it came from,
+// so a generated move can be handed straight to Board::make_move. The state that
+// only make_move knows about lives in MoveRecord, on the board's history stack.
+
+use crate::board::castling::{CastleSide, CastlingRights};
+use crate::board::piece::{Piece, PieceType};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Move {
+    pub from: u8,
+    pub to: u8,
+    pub piece: Piece,
+    pub captured: Option<Piece>,
+    pub castle: Option<CastleSide>,
+    // the piece type the pawn turned into, set only on promotion moves
+    // `piece` stays the pawn, so undo_move can put the pawn back
+    pub promotion: Option<PieceType>,
+    // true when this is an en passant capture: then `captured` does not stand on `to`
+    // but on the square next to `from`
+    pub en_passant: bool,
+}
+
+impl Move {
+    // an ordinary (non castling, non promoting) move
+    pub fn normal(from: u8, to: u8, piece: Piece, captured: Option<Piece>) -> Move {
+        Move {
+            from,
+            to,
+            piece,
+            captured,
+            castle: None,
+            promotion: None,
+            en_passant: false,
+        }
+    }
+
+    // a pawn capturing a pawn that just passed by
+    pub fn en_passant_capture(from: u8, to: u8, piece: Piece, captured: Piece) -> Move {
+        Move {
+            en_passant: true,
+            ..Move::normal(from, to, piece, Some(captured))
+        }
+    }
+
+    // a pawn move that ends on the last rank
+    pub fn promoting(
+        from: u8,
+        to: u8,
+        piece: Piece,
+        captured: Option<Piece>,
+        promote_to: PieceType,
+    ) -> Move {
+        Move {
+            promotion: Some(promote_to),
+            ..Move::normal(from, to, piece, captured)
+        }
+    }
+
+    // the king's part of a castle; make_move moves the rook along with it
+    pub fn castling(king: Piece, from: u8, to: u8, side: CastleSide) -> Move {
+        Move {
+            castle: Some(side),
+            ..Move::normal(from, to, king, None)
+        }
+    }
+
+    // a move after which no earlier position can ever show up again
+    // (the same rule the 50-move counter resets on)
+    pub fn is_irreversible(&self) -> bool {
+        self.captured.is_some() || self.piece.is(PieceType::Pawn)
+    }
+}
+
+// one entry of the board's history: the move plus the bits of state that cannot be
+// worked out from the position afterwards
+pub struct MoveRecord {
+    pub chess_move: Move,
+    pub castling_rights_before: CastlingRights,
+    // the en passant target that was in effect before the move
+    pub en_passant_before: Option<u8>,
+    // the zobrist hash of the position the move was played in, used for repetitions
+    pub hash_before: u64,
+}
