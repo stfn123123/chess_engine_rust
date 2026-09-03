@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 use self::theme::{APP_BG, TEXT_PRIMARY};
 use crate::Settings;
 use crate::board::Board;
-use crate::board::piece::PieceType;
+use crate::board::chess_move::Move;
+use crate::board::piece::{Color, PieceType};
+use crate::evaluate::evaluate;
 use crate::search;
 
 // the panel is a fixed width, the board gets whatever is left over
@@ -25,10 +27,13 @@ const GAP: f32 = 18.0;
 // below this the board is unusable, so it stops shrinking with the window
 const MIN_BOARD_SIZE: f32 = 240.0;
 
-// what the last search run cost, as shown in the side panel
+// what the last search found, and what it cost, as shown in the side panel
 struct SearchStats {
     depth: u32,
-    positions_found: u64,
+    // the move the search would play here, None once the game is over
+    best_move: Option<Move>,
+    // what the search thinks the position is worth, from white's point of view
+    score: i32,
     positions_searched: u64,
     duration: Duration,
 }
@@ -53,6 +58,9 @@ pub struct ChessApp {
     legal_targets: Vec<u8>,
     status: String,
     tone: Tone,
+    // how the position on the board stands, in centipawns from white's point of
+    // view - None once the game is over, when there is nothing left to weigh
+    evaluation: Option<i32>,
     last_search: Option<SearchStats>,
 }
 
@@ -68,10 +76,10 @@ impl ChessApp {
             legal_targets: Vec::new(),
             status: String::new(),
             tone: Tone::Calm,
+            evaluation: None,
             last_search: None,
         };
-        app.refresh_status();
-        app.run_search();
+        app.position_changed();
         app
     }
 
@@ -84,18 +92,48 @@ impl ChessApp {
         self.tone == Tone::Over
     }
 
-    // re-runs the position search and records how long it took; called whenever
-    // the position on the board changes
+    // everything that is worked out from the position and nothing else, in the one
+    // order that works: the status first, because the evaluation asks it whether the
+    // game is still running
+    fn position_changed(&mut self) {
+        self.refresh_status();
+        self.refresh_evaluation();
+        self.run_search();
+    }
+
+    // weighs the position as it now stands
+    fn refresh_evaluation(&mut self) {
+        self.evaluation = if self.game_over() {
+            None
+        } else {
+            Some(self.white_view(evaluate(&self.board)))
+        };
+    }
+
+    // the search and the evaluation both score for the side to move, the panel shows
+    // white's point of view - otherwise the sign would flip with every move and the
+    // number would say more about whose turn it is than about the position
+    fn white_view(&self, score: i32) -> i32 {
+        match self.board.turn() {
+            Color::White => score,
+            Color::Black => -score,
+        }
+    }
+
+    // searches the position for the best move and records what that cost; called
+    // whenever the position on the board changes
     fn run_search(&mut self) {
         let depth = self.settings.search_depth;
         let start = Instant::now();
-        let result = search::count_positions(&mut self.board, depth);
+        let result = search::find_best_move(&mut self.board, depth);
+        let duration = start.elapsed();
 
         self.last_search = Some(SearchStats {
             depth,
-            positions_found: result.positions_found,
+            best_move: result.best_move,
+            score: self.white_view(result.score),
             positions_searched: result.positions_searched,
-            duration: start.elapsed(),
+            duration,
         });
     }
 
@@ -135,8 +173,7 @@ impl ChessApp {
                 self.board
                     .make_move_from_squares(from, square, Some(PieceType::Queen));
                 self.clear_selection();
-                self.refresh_status();
-                self.run_search();
+                self.position_changed();
                 return;
             }
         }

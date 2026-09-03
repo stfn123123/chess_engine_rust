@@ -1,15 +1,9 @@
 # Goals / Todo
 
-## testing
-- count number of positions from different angles and compare to stockfish etc
-- test speed and perhaps speed up the process
-
 ## Evaluation
-- create an evaluation function
-- PSQT
 
 ## Search
-- alph/beta Search
+- quiescence search
 - improve Zobrist (TESTING)
 - transposition table
   - storing information:
@@ -18,6 +12,14 @@
   - depth
   - score
   - Type of Node (exact, upper bound, lower bound)
+
+## Performance
+- Board::king_square searches the board for the king every time it is asked
+  (squares_with(King, color).next()), and is asked several times per node -
+  by is_check, legal_moves_for, evaluate_pins, possible_king_attackers.
+  Worth a look: keep the two king squares on the board and update them in
+  set_square.
+- psqt inefficient? always have to find all pieces positions at every evaluation?
 
 ## Visuals
 - add interactable and visual chess board

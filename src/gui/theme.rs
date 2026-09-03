@@ -27,3 +27,4 @@ pub const DANGER: egui::Color32 = egui::Color32::from_rgb(214, 106, 96);
 // one colour per search number, so the panel can be read without looking at labels
 pub const STAT_TIME: egui::Color32 = egui::Color32::from_rgb(132, 172, 214);
 pub const STAT_SPEED: egui::Color32 = egui::Color32::from_rgb(126, 186, 128);
+pub const STAT_EVAL: egui::Color32 = egui::Color32::from_rgb(186, 162, 214);

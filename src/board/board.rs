@@ -359,15 +359,11 @@ impl Board {
 
         let (white_bishops, white_knights) = self.minor_piece_count(Color::White);
         let (black_bishops, black_knights) = self.minor_piece_count(Color::Black);
-        let white_minors = white_bishops + white_knights;
-        let black_minors = black_bishops + black_knights;
 
-        if white_minors <= 1 && black_minors <= 1 {
-            return true;
-        }
-
-        (white_minors == 0 && black_bishops == 0 && black_knights == 2)
-            || (black_minors == 0 && white_bishops == 0 && white_knights == 2)
+        insufficient_minors(
+            [white_bishops, black_bishops],
+            [white_knights, black_knights],
+        )
     }
 
     // (bishops, knights) of one side
@@ -377,6 +373,23 @@ impl Board {
             self.squares_with(PieceType::Knight, color).count(),
         )
     }
+}
+
+// with no pawns, rooks or queens left, whether anyone can still mate comes down to
+// the minor pieces alone: one minor each at most cannot do it, and neither can two
+// knights against a bare king
+// both counts are [white, black]; kept out of `Board` so that a caller which has
+// counted the pieces for its own reasons can ask without counting them again
+pub fn insufficient_minors(bishops: [usize; 2], knights: [usize; 2]) -> bool {
+    let white_minors = bishops[0] + knights[0];
+    let black_minors = bishops[1] + knights[1];
+
+    if white_minors <= 1 && black_minors <= 1 {
+        return true;
+    }
+
+    (white_minors == 0 && bishops[1] == 0 && knights[1] == 2)
+        || (black_minors == 0 && bishops[0] == 0 && knights[0] == 2)
 }
 
 // -------------------- keeping the hash in sync --------------------

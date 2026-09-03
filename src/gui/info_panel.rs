@@ -8,11 +8,14 @@ use eframe::egui;
 use std::time::Duration;
 
 use super::theme::{
-    ACCENT, BLACK_SIDE, CALM, DANGER, PANEL_BG, PANEL_BORDER, STAT_SPEED, STAT_TIME, TEXT_MUTED,
-    TEXT_PRIMARY, WARNING, WHITE_SIDE,
+    ACCENT, BLACK_SIDE, CALM, DANGER, PANEL_BG, PANEL_BORDER, STAT_EVAL, STAT_SPEED, STAT_TIME,
+    TEXT_MUTED, TEXT_PRIMARY, WARNING, WHITE_SIDE,
 };
 use super::{ChessApp, Tone};
+use crate::board::chess_move::Move;
 use crate::board::piece::Color;
+use crate::board::square::{file_of, rank_of};
+use crate::evaluate::MATE;
 
 pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
@@ -53,6 +56,7 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
 
                 turn_block(app, ui);
                 status_block(app, ui);
+                evaluation_block(app, ui);
 
                 divider(ui);
                 ui.add_space(16.0);
@@ -115,7 +119,18 @@ fn status_block(app: &ChessApp, ui: &mut egui::Ui) {
     ui.add_space(18.0);
 }
 
-// the four numbers of the last search, each in its own colour
+// how the position stands after the last move, in pawns from white's point of view
+fn evaluation_block(app: &ChessApp, ui: &mut egui::Ui) {
+    let (value, color) = match app.evaluation {
+        Some(score) => (format_evaluation(score), STAT_EVAL),
+        // the game is over, so the status line above is the whole story
+        None => ("-".to_string(), TEXT_MUTED),
+    };
+
+    stat_block(ui, "EVALUATION (WHITE)", &value, color);
+}
+
+// what the last search found, and what it cost, each in its own colour
 fn search_blocks(app: &ChessApp, ui: &mut egui::Ui) {
     ui.label(
         egui::RichText::new("SEARCH")
@@ -142,12 +157,18 @@ fn search_blocks(app: &ChessApp, ui: &mut egui::Ui) {
         0.0
     };
 
+    let best_move = match &stats.best_move {
+        Some(chess_move) => format_move(chess_move),
+        None => "-".to_string(),
+    };
+
     stat_block(
         ui,
-        &format!("POSITIONS AT DEPTH {}", stats.depth),
-        &format_count(stats.positions_found),
+        &format!("BEST MOVE AT DEPTH {}", stats.depth),
+        &best_move,
         ACCENT,
     );
+    stat_block(ui, "SCORE (WHITE)", &format_score(stats.score), STAT_EVAL);
     stat_block(
         ui,
         "POSITIONS SEARCHED",
@@ -213,6 +234,57 @@ fn format_count(count: u64) -> String {
         out.push(digit);
     }
     out.chars().rev().collect()
+}
+
+// a move as the two squares it goes between, e.g. "e2e4", with the promoted piece
+// after them when there is one
+fn format_move(chess_move: &Move) -> String {
+    let mut text = format!(
+        "{}{}",
+        square_name(chess_move.from),
+        square_name(chess_move.to)
+    );
+
+    if let Some(promotion) = chess_move.promotion {
+        text.push(promotion.letter());
+    }
+
+    text
+}
+
+fn square_name(square: u8) -> String {
+    let file = (b'a' + file_of(square)) as char;
+    let rank = (b'1' + rank_of(square)) as char;
+    format!("{file}{rank}")
+}
+
+// a search score: a mate reads as the number of moves until it, everything else as
+// pawns like the static evaluation
+fn format_score(score: i32) -> String {
+    // every mate score sits within one search's worth of plies of MATE
+    let plies_to_mate = MATE - score.abs();
+    if plies_to_mate < 1000 {
+        // a mate `n` plies away is delivered on move (n + 1) / 2
+        let moves = (plies_to_mate + 1) / 2;
+        let sign = if score < 0 { "-" } else { "" };
+        // a mate that is already on the board has no moves left to count
+        return if moves == 0 {
+            format!("{sign}#")
+        } else {
+            format!("{sign}#{moves}")
+        };
+    }
+
+    format_evaluation(score)
+}
+
+// centipawns as pawns, the way an engine reads them out: "+0.40", "-1.25", "0.00"
+fn format_evaluation(score: i32) -> String {
+    if score == 0 {
+        return "0.00".to_string();
+    }
+
+    format!("{:+.2}", score as f64 / 100.0)
 }
 
 fn format_duration(duration: Duration) -> String {

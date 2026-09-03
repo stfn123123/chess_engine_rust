@@ -10,8 +10,8 @@ mod evaluate;
 // the knobs the engine runs with
 #[derive(Clone, Copy)]
 pub struct Settings {
-    // how deep the position count runs after every move; one ply more multiplies the
-    // work by roughly the number of legal moves in a position
+    // how deep the search runs after every move; one ply more multiplies the work by
+    // roughly the number of legal moves in a position, less what the pruning saves
     pub search_depth: u32,
 }
 

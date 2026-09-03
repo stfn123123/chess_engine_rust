@@ -35,7 +35,8 @@ impl Board {
             return self.pseudo_legal_moves(color);
         };
 
-        let mut moves = Vec::new();
+        // a position holds around forty moves, so one allocation covers the whole list
+        let mut moves = Vec::with_capacity(48);
         let king = Piece::new(PieceType::King, color);
         self.king_moves(&mut moves, king, king_square);
 
@@ -54,6 +55,11 @@ impl Board {
             None => u64::MAX,
         };
 
+        // the moves of the piece being looked at, before the mask above has had its
+        // say - one buffer for the whole walk, emptied and refilled per piece, so no
+        // piece allocates one of its own
+        let mut candidates = Vec::with_capacity(32);
+
         // walking the squares once and dispatching on what stands there beats asking
         // for the squares of all six piece types one after the other
         for from in 0..64u8 {
@@ -71,7 +77,10 @@ impl Board {
                 None => answers_check,
             };
 
-            for candidate in self.moves_for_piece(piece, from) {
+            candidates.clear();
+            self.moves_for_piece(&mut candidates, piece, from);
+
+            for &candidate in &candidates {
                 let legal = if candidate.en_passant {
                     // the pawn it takes stands beside the square it ends on, so neither
                     // mask can judge this move - the attack scan has to
@@ -89,7 +98,7 @@ impl Board {
         // castling out of check is never allowed; castle_moves itself refuses to castle
         // through or into an attacked square
         if safety.checkers.count == 0 {
-            moves.extend(self.castle_moves(color));
+            self.castle_moves(&mut moves, color);
         }
 
         moves
@@ -98,40 +107,40 @@ impl Board {
     // every move of one side that follows the movement rules, whether or not it leaves
     // the own king in check - only used for boards that hold no king at all
     fn pseudo_legal_moves(&self, color: Color) -> Vec<Move> {
-        let mut moves = Vec::new();
+        let mut moves = Vec::with_capacity(48);
 
         for piece_type in PieceType::ALL {
             for from in self.squares_with(piece_type, color) {
                 let piece = Piece::new(piece_type, color);
-                moves.extend(self.moves_for_piece(piece, from));
+                self.moves_for_piece(&mut moves, piece, from);
             }
         }
-        moves.extend(self.castle_moves(color));
+        self.castle_moves(&mut moves, color);
 
         moves
     }
 
     // the pseudo-legal moves of a single piece, castling aside
-    fn moves_for_piece(&self, piece: Piece, from: u8) -> Vec<Move> {
+    // every generator below appends to the list it is handed instead of returning one
+    // of its own: the search asks for the moves of a position hundreds of thousands of
+    // times, and a Vec per piece is an allocation per piece
+    fn moves_for_piece(&self, moves: &mut Vec<Move>, piece: Piece, from: u8) {
         match piece.piece_type() {
-            PieceType::Bishop => self.sliding_moves(piece, from, &DIAGONAL_STEPS),
-            PieceType::Rook => self.sliding_moves(piece, from, &STRAIGHT_STEPS),
+            PieceType::Bishop => self.sliding_moves(moves, piece, from, &DIAGONAL_STEPS),
+            PieceType::Rook => self.sliding_moves(moves, piece, from, &STRAIGHT_STEPS),
             PieceType::Queen => {
-                let mut moves = self.sliding_moves(piece, from, &DIAGONAL_STEPS);
-                moves.extend(self.sliding_moves(piece, from, &STRAIGHT_STEPS));
-                moves
+                self.sliding_moves(moves, piece, from, &DIAGONAL_STEPS);
+                self.sliding_moves(moves, piece, from, &STRAIGHT_STEPS);
             }
-            PieceType::Knight => self.stepping_moves(piece, from, &KNIGHT_STEPS),
-            PieceType::King => self.stepping_moves(piece, from, &KING_STEPS),
-            PieceType::Pawn => self.pawn_moves(piece, from),
+            PieceType::Knight => self.stepping_moves(moves, piece, from, &KNIGHT_STEPS),
+            PieceType::King => self.stepping_moves(moves, piece, from, &KING_STEPS),
+            PieceType::Pawn => self.pawn_moves(moves, piece, from),
         }
     }
 
     // walks in each direction until the edge of the board, a friendly piece, or a
     // capture is hit - bishops, rooks and queens
-    fn sliding_moves(&self, piece: Piece, from: u8, steps: &[(i8, i8)]) -> Vec<Move> {
-        let mut moves = Vec::new();
-
+    fn sliding_moves(&self, moves: &mut Vec<Move>, piece: Piece, from: u8, steps: &[(i8, i8)]) {
         for &step in steps {
             for to in ray(from, step) {
                 match self.piece_at(to) {
@@ -146,8 +155,6 @@ impl Board {
                 }
             }
         }
-
-        moves
     }
 
     // every piece of `color` that lines up with the opposing king, with whatever stands
@@ -267,9 +274,7 @@ impl Board {
     }
 
     // applies each step once instead of sliding - knights and kings
-    fn stepping_moves(&self, piece: Piece, from: u8, steps: &[(i8, i8)]) -> Vec<Move> {
-        let mut moves = Vec::new();
-
+    fn stepping_moves(&self, moves: &mut Vec<Move>, piece: Piece, from: u8, steps: &[(i8, i8)]) {
         for &step in steps {
             let Some(to) = offset(from, step) else {
                 continue;
@@ -283,8 +288,6 @@ impl Board {
                 Some(_) => {}
             }
         }
-
-        moves
     }
 
     // the king steps onto every square around it that no enemy piece covers
@@ -329,16 +332,15 @@ impl Board {
 
     // one or two squares forward onto empty squares, diagonal captures, en passant,
     // and every promotion choice on the last rank
-    fn pawn_moves(&self, piece: Piece, from: u8) -> Vec<Move> {
+    fn pawn_moves(&self, moves: &mut Vec<Move>, piece: Piece, from: u8) {
         let color = piece.color();
         let direction = color.pawn_direction();
-        let mut moves = Vec::new();
 
         // a pawn can only push onto an empty square, and only push twice from its start
         // rank and only when the square it steps over is empty as well
         let one_forward = offset(from, (0, direction)).filter(|&to| self.piece_at(to).is_none());
         if let Some(one_forward) = one_forward {
-            push_pawn_move(&mut moves, from, one_forward, piece, None);
+            push_pawn_move(moves, from, one_forward, piece, None);
 
             if rank_of(from) == color.pawn_start_rank() {
                 let two_forward =
@@ -356,7 +358,7 @@ impl Board {
 
             match self.piece_at(to) {
                 Some(occupant) if occupant.color() != color => {
-                    push_pawn_move(&mut moves, from, to, piece, Some(occupant));
+                    push_pawn_move(moves, from, to, piece, Some(occupant));
                 }
                 Some(_) => {}
                 // the rank check makes sure only the side to move can take en passant
@@ -371,18 +373,15 @@ impl Board {
                 None => {}
             }
         }
-
-        moves
     }
 
     // the castling moves of one side
-    fn castle_moves(&self, color: Color) -> Vec<Move> {
-        let mut moves = Vec::new();
+    fn castle_moves(&self, moves: &mut Vec<Move>, color: Color) {
         let king_from = king_start_square(color);
 
         let king = match self.piece_at(king_from) {
             Some(piece) if piece.is(PieceType::King) && piece.color() == color => piece,
-            _ => return moves,
+            _ => return,
         };
 
         for side in CastleSide::BOTH {
@@ -417,8 +416,6 @@ impl Board {
 
             moves.push(Move::castling(king, king_from, king_to, side));
         }
-
-        moves
     }
 
     // is the given square attacked by any piece of the given color
