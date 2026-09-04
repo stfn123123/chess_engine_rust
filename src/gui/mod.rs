@@ -18,7 +18,7 @@ use crate::Settings;
 use crate::board::Board;
 use crate::board::chess_move::Move;
 use crate::board::piece::{Color, PieceType};
-use crate::evaluate::evaluate;
+use crate::evaluate::{evaluate, game_phase_of};
 use crate::search;
 
 // the panel is a fixed width, the board gets whatever is left over
@@ -61,6 +61,8 @@ pub struct ChessApp {
     // how the position on the board stands, in centipawns from white's point of
     // view - None once the game is over, when there is nothing left to weigh
     evaluation: Option<i32>,
+    // how late the game is: 1.00 on the opening board, 0.00 once the pieces are off
+    phase: f32,
     last_search: Option<SearchStats>,
 }
 
@@ -77,6 +79,7 @@ impl ChessApp {
             status: String::new(),
             tone: Tone::Calm,
             evaluation: None,
+            phase: 1.0,
             last_search: None,
         };
         app.position_changed();
@@ -103,6 +106,8 @@ impl ChessApp {
 
     // weighs the position as it now stands
     fn refresh_evaluation(&mut self) {
+        self.phase = game_phase_of(&self.board);
+
         self.evaluation = if self.game_over() {
             None
         } else {

@@ -11,18 +11,26 @@
 // it need not be looked at. The cutoff changes nothing about the move that comes
 // out - it only saves work.
 //
+// The depth asked for is only where the full move list stops - quiescence carries on
+// with captures from there, so no line is scored in the middle of a trade.
+//
 // count_positions is the perft: it plays out every legal move sequence up to a
 // given depth and counts the leaves. The counts for known positions are published,
 // so they are the way to tell whether move generation is correct.
 
 use crate::board::Board;
 use crate::board::chess_move::Move;
-use crate::evaluate::{MATE, evaluate};
+use crate::board::piece::PieceType;
+use crate::evaluate::{MATE, evaluate, piece_value};
 
 // how deep the search runs unless something asks for another depth
-pub const DEFAULT_DEPTH: u32 = 8;
+pub const DEFAULT_DEPTH: u32 = 4;
 
 const INFINITY: i32 = 1_000_000;
+
+// how far short of alpha a capture may fall and still be worth looking at - covers
+// the piece-square swing of both pieces, which is not known before the move is played
+const DELTA_MARGIN: i32 = 200;
 
 pub struct SearchResult {
     pub depth: u32,
@@ -48,7 +56,13 @@ pub fn find_best_move(board: &mut Board, depth: u32) -> SearchResult {
     }
 
     if depth == 0 {
-        result.score = evaluate(board);
+        result.score = quiescence(
+            board,
+            -INFINITY,
+            INFINITY,
+            0,
+            &mut result.positions_searched,
+        );
         return result;
     }
 
@@ -95,7 +109,7 @@ fn alpha_beta(
     }
 
     if depth == 0 {
-        return leaf_score(board, ply);
+        return quiescence(board, alpha, beta, ply, positions_searched);
     }
 
     // the move list is in hand here, so whether the game ended costs nothing to ask
@@ -135,17 +149,100 @@ fn terminal_score(board: &Board, ply: u32) -> i32 {
     }
 }
 
-// what a leaf is worth: its material, unless the game ended right on it
-// the move list would answer that, but generating one at every leaf costs more than
-// the whole search - and only a side that stands in check can be mated, which is a
-// single attack scan to ask. So the generation only runs where a mate is possible at
-// all, and the price of that is a stalemate exactly on the horizon read as material
-fn leaf_score(board: &Board, ply: u32) -> i32 {
-    if board.is_check(board.turn()) && board.legal_moves().is_empty() {
-        return -MATE + ply as i32;
+// captures only, until nothing is hanging, then evaluate
+// the window is the caller's, not a fresh one - that is where most of the pruning is
+fn quiescence(
+    board: &mut Board,
+    mut alpha: i32,
+    beta: i32,
+    ply: u32,
+    positions_searched: &mut u64,
+) -> i32 {
+    *positions_searched += 1;
+
+    // no standing pat out of a check, and every evasion counts, not only the captures
+    if board.is_check(board.turn()) {
+        let moves = board.legal_moves();
+        if moves.is_empty() {
+            return terminal_score(board, ply);
+        }
+
+        for chess_move in moves {
+            board.make_move(&chess_move);
+            let score = -quiescence(board, -beta, -alpha, ply + 1, positions_searched);
+            board.undo_move();
+
+            if score >= beta {
+                return beta;
+            }
+            if score > alpha {
+                alpha = score;
+            }
+        }
+
+        return alpha;
     }
 
-    evaluate(board)
+    // nobody is forced to capture, so this is a floor - asked before generating
+    // anything, because most nodes down here cut off on it
+    let stand_pat = evaluate(board);
+    if stand_pat >= beta {
+        return beta;
+    }
+    if stand_pat > alpha {
+        alpha = stand_pat;
+    }
+
+    let mut captures = board.legal_captures();
+    order_captures(&mut captures);
+
+    for chess_move in captures {
+        // delta pruning: winning this piece for free still would not reach alpha
+        if stand_pat + optimistic_gain(&chess_move) + DELTA_MARGIN < alpha {
+            continue;
+        }
+
+        board.make_move(&chess_move);
+        let score = -quiescence(board, -beta, -alpha, ply + 1, positions_searched);
+        board.undo_move();
+
+        if score >= beta {
+            return beta;
+        }
+        if score > alpha {
+            alpha = score;
+        }
+    }
+
+    alpha
+}
+
+// MVV-LVA: the victim weighs eight times the attacker, so what is taken decides the
+// order and what takes it only breaks ties
+fn order_captures(captures: &mut [Move]) {
+    captures.sort_unstable_by_key(|chess_move| {
+        let victim = chess_move
+            .captured
+            .map_or(0, |piece| piece_value(piece.piece_type()));
+        let attacker = piece_value(chess_move.piece.piece_type());
+
+        // negated because sort_unstable_by_key orders ascending
+        -(victim * 8 - attacker)
+    });
+}
+
+// the most a capture could bring in: what it takes, plus what a promotion turns into
+fn optimistic_gain(chess_move: &Move) -> i32 {
+    let victim = chess_move
+        .captured
+        .map_or(0, |piece| piece_value(piece.piece_type()));
+    let promotion = chess_move
+        .promotion
+        .map_or(0, |piece_type| {
+            piece_value(piece_type) - piece_value(PieceType::Pawn)
+        });
+
+    (victim + promotion) as i32
 }
 
 // how many positions are `depth` plies away - the check that move generation is
@@ -207,7 +304,8 @@ mod tests {
         }
 
         if depth == 0 {
-            return leaf_score(board, ply);
+            // full window, so delta pruning can never fire
+            return quiescence(board, -INFINITY, INFINITY, ply, &mut 0);
         }
 
         let moves = board.legal_moves();
@@ -223,6 +321,97 @@ mod tests {
         }
 
         best
+    }
+
+    // find_best_move's root loop, without a window and without cutoffs
+    fn negamax_best(board: &mut Board, depth: u32) -> (Option<Move>, i32) {
+        let moves = board.legal_moves();
+        if moves.is_empty() {
+            return (None, terminal_score(board, 0));
+        }
+
+        let mut best_move = None;
+        let mut best_score = -INFINITY;
+        for chess_move in moves {
+            board.make_move(&chess_move);
+            let score = -negamax(board, depth - 1, 1);
+            board.undo_move();
+
+            if best_move.is_none() || score > best_score {
+                best_score = score;
+                best_move = Some(chess_move);
+            }
+        }
+
+        (best_move, best_score)
+    }
+
+    // a queen against two pawns, with the e6 pawn covering d5
+    fn queen_against_pawns() -> Board {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        board.add_piece(Piece::new(PieceType::Queen, Color::White), 3); // d1
+        board.add_piece(Piece::new(PieceType::Pawn, Color::White), 8); // a2
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 63); // h8
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 44); // e6
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 55); // h7
+        board
+    }
+
+    // at one ply the search moves and stops, so Qxd5 reads as a free pawn - only
+    // quiescence finds exd5
+    #[test]
+    fn a_defended_pawn_is_not_taken_by_the_queen() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        board.add_piece(Piece::new(PieceType::Queen, Color::White), 3); // d1
+        board.add_piece(Piece::new(PieceType::Pawn, Color::White), 8); // a2
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 63); // h8
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 35); // d5
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 44); // e6
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 55); // h7
+
+        let result = find_best_move(&mut board, 1);
+        let best = result.best_move.expect("white has moves");
+
+        assert_ne!(
+            (best.from, best.to),
+            (3, 35),
+            "the queen took a pawn that the e6 pawn defends"
+        );
+    }
+
+    // exd5 is two plies inside a four ply search, so the horizon is no excuse
+    #[test]
+    fn the_queen_is_not_walked_onto_a_pawn() {
+        let mut board = queen_against_pawns();
+
+        let result = find_best_move(&mut board, 4);
+        let best = result.best_move.expect("white has moves");
+
+        assert_ne!(
+            (best.from, best.to),
+            (3, 35),
+            "the queen stepped onto d5, where the e6 pawn takes it"
+        );
+        assert!(
+            result.score > 500,
+            "white is a queen up but the search scored {}",
+            result.score
+        );
+    }
+
+    // the same check as below, but somewhere there is something to win or lose
+    #[test]
+    fn pruning_does_not_change_the_score_in_a_tactical_position() {
+        let mut board = queen_against_pawns();
+
+        for depth in 1..=4 {
+            let searched = find_best_move(&mut board, depth);
+            let (_, reference) = negamax_best(&mut board, depth);
+
+            assert_eq!(searched.score, reference, "at depth {depth}");
+        }
     }
 
     // the whole point of the pruning: it only skips moves that cannot change the

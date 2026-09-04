@@ -1,9 +1,12 @@
 // How good a position is, in centipawns.
 //
 // The score is material plus a piece-square bonus: every piece is worth a base
-// value, and standing on a good square is worth a little more. That is the whole
-// evaluation for now - the bishop pair and the interpolation between a middlegame
-// and an endgame score are prepared below but not used yet.
+// value, and standing on a good square is worth a little more. On top of that come
+// the bishop pair and where the king wants to stand, both read off the game phase.
+//
+// The phase counts pieces, not centipawns: TOTAL_PHASE with everything standing,
+// 0 once only kings and pawns are left. Weights that differ between the two ends are
+// written W(middlegame, endgame). The board keeps the count; nothing here walks for it.
 //
 // The score is always for the side to move: positive means the side whose turn it
 // is stands better, whichever side that is. That is what negamax wants - it only
@@ -18,7 +21,15 @@ use crate::board::piece::{Color, PieceType};
 
 type Psqt = [i16; 64];
 type PsqtSet = [Psqt; 6];
+
+// W(middlegame, endgame)
 struct W(i16, i16);
+
+impl W {
+    fn at(self, phase: i32) -> i32 {
+        interpolate(self.0, self.1, phase)
+    }
+}
 
 const KING_BASE: i16 = 0;
 const QUEEN_BASE: i16 = 900;
@@ -27,13 +38,10 @@ const KNIGHT_BASE: i16 = 300;
 const BISHOP_BASE: i16 = 300;
 const PAWN_BASE: i16 = 100;
 
-// being checkmated, i.e. the worst a position can be for the side to move
-// it has to sit far above what any material can be worth, so that no amount of
-// pieces ever looks as good as a mate does
 pub const MATE: i32 = 100_000;
 
 
-#[allow(dead_code)]
+// the pair tells more as the board empties
 const BISHOP_PAIR: W = W(10, 40);
 
 const QUEEN: Psqt = [
@@ -102,9 +110,8 @@ const KING_MID: Psqt = [
     20, 30, 10,  0,  0, 10, 30, 20
 ];
 
-// the king is the only piece whose good squares change completely towards the end
-// of the game, so this one waits for the interpolation
-#[allow(dead_code)]
+// the king is the one piece whose good squares turn around by the endgame - corner
+// early, centre late, interpolated between
 const KING_END: Psqt = [
     -50,-40,-30,-20,-20,-30,-40,-50,
     -30,-20,-10,  0,  0,-10,-20,-30,
@@ -137,9 +144,14 @@ const BASE_VALUES: [i16; 6] = [
     QUEEN_BASE,
 ];
 
+// a full board, summed from the weights so retuning one cannot leave this behind
+const TOTAL_PHASE: i32 = 2 * (2 * PieceType::Knight.phase_weight()
+    + 2 * PieceType::Bishop.phase_weight()
+    + 2 * PieceType::Rook.phase_weight()
+    + PieceType::Queen.phase_weight());
+
 // evaluate the current side vs the enemy side: positive is good for the side to move
 pub fn evaluate(board: &Board) -> i32 {
-
     let mut score = 0;
     let mut can_mate = false;
     let mut bishops = [0; 2];
@@ -149,17 +161,17 @@ pub fn evaluate(board: &Board) -> i32 {
         let Some(piece) = board.piece_at(square) else {
             continue;
         };
+        let piece_type = piece.piece_type();
 
-        match piece.piece_type() {
-            // a pawn promotes, a rook and a queen mate on their own: any one of them
-            // settles the question
+        match piece_type {
             PieceType::Pawn | PieceType::Rook | PieceType::Queen => can_mate = true,
             PieceType::Bishop => bishops[color_index(piece.color())] += 1,
             PieceType::Knight => knights[color_index(piece.color())] += 1,
-            PieceType::King => {}
+            // scored in king_score instead, once the phase is in hand
+            PieceType::King => continue,
         }
 
-        let value = piece_score(piece.piece_type(), piece.color(), square) as i32;
+        let value = piece_score(piece_type, piece.color(), square) as i32;
         // white counts up, black counts down
         score += match piece.color() {
             Color::White => value,
@@ -172,11 +184,25 @@ pub fn evaluate(board: &Board) -> i32 {
         return 0;
     }
 
+    // clamped because a promotion can put more on than the game started with
+    let phase = board.phase().clamp(0, TOTAL_PHASE);
+    score += king_score(board, phase);
+    score += bishop_pair_score(bishops, phase);
+
     // and now out of white's point of view and into the side to move's
     match board.turn() {
         Color::White => score,
         Color::Black => -score,
     }
+}
+
+pub fn piece_value(piece_type: PieceType) -> i16 {
+    BASE_VALUES[piece_type as usize - 1]
+}
+
+
+pub fn game_phase_of(board: &Board) -> f32 {
+    board.phase().clamp(0, TOTAL_PHASE) as f32 / TOTAL_PHASE as f32
 }
 
 // the two sides as the rows of the counting tables above
@@ -199,6 +225,53 @@ fn table_index(square: u8, color: Color) -> usize {
     }
 }
 
+// integer on purpose: this is the innermost thing evaluate does
+fn interpolate(middlegame: i16, endgame: i16, phase: i32) -> i32 {
+    (middlegame as i32 * phase + endgame as i32 * (TOTAL_PHASE - phase)) / TOTAL_PHASE
+}
+
+fn king_score(board: &Board, phase: i32) -> i32 {
+    let mut score = 0;
+
+    for color in Color::BOTH {
+        // None only on a hand built board
+        let Some(square) = board.king_square(color) else {
+            continue;
+        };
+
+        let index = table_index(square, color);
+        let value = interpolate(KING_MID[index], KING_END[index], phase);
+
+        score += match color {
+            Color::White => value,
+            Color::Black => -value,
+        };
+    }
+
+    score
+}
+
+// two or more, so a promoted third bishop does not pay twice
+fn bishop_pair_score(bishops: [usize; 2], phase: i32) -> i32 {
+    let bonus = BISHOP_PAIR.at(phase);
+    let mut score = 0;
+
+    if bishops[color_index(Color::White)] >= 2 {
+        score += bonus;
+    }
+    if bishops[color_index(Color::Black)] >= 2 {
+        score -= bonus;
+    }
+
+    score
+}
+// TODO: evaluate own Pawn structure
+// minus points for doubled pawns, and lone pawns,
+// + points for a passed pawn
+// - points for weak pawns
+fn pawn_structure() -> i32 {
+    return 0
+}
 
 
 
@@ -222,6 +295,63 @@ mod tests {
     #[test]
     fn the_start_position_is_equal() {
         assert_eq!(evaluate(&start_position()), 0);
+    }
+
+    // the clock everything else is read off has to sit at the two ends of its range
+    // where the range says it does, or every weight hanging off it is skewed
+    #[test]
+    fn the_phase_runs_from_a_full_board_down_to_bare_kings() {
+        assert_eq!(game_phase_of(&start_position()), 1.0);
+
+        let mut bare = Board::new();
+        bare.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        bare.add_piece(Piece::new(PieceType::King, Color::Black), 60); // e8
+
+        assert_eq!(game_phase_of(&bare), 0.0);
+    }
+
+    // the case the piece count is for - counting centipawns read this as 0.205
+    #[test]
+    fn a_pawn_endgame_is_all_the_way_into_the_endgame() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 60); // e8
+
+        for file in 0..8 {
+            board.add_piece(Piece::new(PieceType::Pawn, Color::White), 8 + file);
+            board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 48 + file);
+        }
+
+        assert_eq!(game_phase_of(&board), 0.0);
+    }
+
+    #[test]
+    fn the_queens_carry_a_third_of_the_phase() {
+        let queens = 2 * PieceType::Queen.phase_weight();
+
+        assert_eq!(queens * 3, TOTAL_PHASE);
+        assert_eq!(PieceType::Pawn.phase_weight(), 0);
+        assert_eq!(PieceType::King.phase_weight(), 0);
+    }
+
+    #[test]
+    fn the_bishop_pair_grows_towards_the_endgame() {
+        assert_eq!(bishop_pair_score([2, 0], TOTAL_PHASE), 10);
+        assert_eq!(bishop_pair_score([2, 0], 0), 40);
+
+        assert_eq!(bishop_pair_score([1, 0], 0), 0, "one bishop is not a pair");
+        assert_eq!(bishop_pair_score([2, 2], 0), 0, "both sides have it");
+    }
+
+    // same board, both ends of the phase - the answer has to change sign
+    #[test]
+    fn the_king_turns_around_towards_the_endgame() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 28); // e4
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 62); // g8
+
+        assert!(king_score(&board, TOTAL_PHASE) < 0, "centre is bad early");
+        assert!(king_score(&board, 0) > 0, "centre is good late");
     }
 
     #[test]

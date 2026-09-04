@@ -12,6 +12,9 @@ use crate::board::zobrist::ZOBRIST;
 pub struct Board {
     turn: Color,
     squares: [Option<Piece>; 64],
+    // where each king stands, indexed by Color::index - kept here because the move
+    // generator asks for it several times per position
+    king_squares: [Option<u8>; 2],
     // every move played so far, together with what is needed to take it back
     history: Vec<MoveRecord>,
     castling_rights: CastlingRights,
@@ -24,6 +27,9 @@ pub struct Board {
     // the en passant key that is currently mixed into `hash`, 0 when there is none
     // remembered because whether a target is capturable can change with the position
     en_passant_hash: u64,
+    // the phase weights of everything standing, added up - kept here because only a
+    // capture or a promotion can change it
+    phase: i32,
 }
 
 // -------------------- setting up --------------------
@@ -34,12 +40,15 @@ impl Board {
         Board {
             turn: Color::White,
             squares: [None; 64],
+            king_squares: [None; 2],
             history: Vec::new(),
             castling_rights,
             en_passant_target: None,
             // white to move and no en passant target contribute nothing
             hash: ZOBRIST.castling(castling_rights),
             en_passant_hash: 0,
+            // an empty board has nothing standing on it
+            phase: 0,
         }
     }
 
@@ -102,7 +111,12 @@ impl Board {
 
     // where the king of that side stands - None only on a hand built board
     pub(crate) fn king_square(&self, color: Color) -> Option<u8> {
-        self.squares_with(PieceType::King, color).next()
+        self.king_squares[color.index()]
+    }
+
+    // the raw count, so a promotion can push it past a full board
+    pub fn phase(&self) -> i32 {
+        self.phase
     }
 
     // every square holding a piece of that type and color
@@ -204,6 +218,12 @@ impl Board {
         self.set_en_passant_target(target);
 
         debug_assert_eq!(self.hash, self.full_hash(), "incremental hash drifted");
+        debug_assert_eq!(
+            self.king_squares,
+            self.searched_king_squares(),
+            "king squares drifted"
+        );
+        debug_assert_eq!(self.phase, self.counted_phase(), "phase drifted");
     }
 
     // plays the move going from one square to another, for callers that only have the
@@ -247,6 +267,12 @@ impl Board {
         self.set_en_passant_target(record.en_passant_before);
 
         debug_assert_eq!(self.hash, self.full_hash(), "incremental hash drifted");
+        debug_assert_eq!(
+            self.king_squares,
+            self.searched_king_squares(),
+            "king squares drifted"
+        );
+        debug_assert_eq!(self.phase, self.counted_phase(), "phase drifted");
 
         Some(chess_move)
     }
@@ -293,6 +319,11 @@ impl Board {
     // has to be played and taken back again here
     pub fn legal_moves(&self) -> Vec<Move> {
         self.legal_moves_for(self.turn)
+    }
+
+    // only the moves that take something, for the quiescence search
+    pub fn legal_captures(&self) -> Vec<Move> {
+        self.legal_captures_for(self.turn)
     }
 
     // is the king of the given side in check
@@ -394,15 +425,29 @@ pub fn insufficient_minors(bishops: [usize; 2], knights: [usize; 2]) -> bool {
 
 // -------------------- keeping the hash in sync --------------------
 impl Board {
-    // every write to a square goes through here, so that the hash stays in sync with
-    // the board - xor is its own inverse, so taking a piece off a square is the same
-    // operation as putting it there
+    // every write to a square goes through here, so the hash, the king squares and the
+    // phase stay in sync - xor is its own inverse, so taking off and putting on are one
     fn set_square(&mut self, square: u8, piece: Option<Piece>) {
         if let Some(previous) = self.squares[square as usize] {
             self.hash ^= ZOBRIST.piece(square, previous);
+            // no guard needed here: this counts what is standing, not where it stands
+            self.phase -= previous.piece_type().phase_weight();
+
+            // only clear when this is still the recorded square: a move writes the king
+            // onto `to` before clearing `from`, and that write already moved the record
+            if previous.is(PieceType::King)
+                && self.king_squares[previous.color().index()] == Some(square)
+            {
+                self.king_squares[previous.color().index()] = None;
+            }
         }
         if let Some(piece) = piece {
             self.hash ^= ZOBRIST.piece(square, piece);
+            self.phase += piece.piece_type().phase_weight();
+
+            if piece.is(PieceType::King) {
+                self.king_squares[piece.color().index()] = Some(square);
+            }
         }
 
         self.squares[square as usize] = piece;
@@ -448,6 +493,20 @@ impl Board {
         });
 
         if can_capture { Some(target) } else { None }
+    }
+
+    // the king squares searched for from scratch, for the debug_asserts to check
+    fn searched_king_squares(&self) -> [Option<u8>; 2] {
+        Color::BOTH.map(|color| self.squares_with(PieceType::King, color).next())
+    }
+
+    // the phase counted from scratch, for the debug_asserts to check against
+    fn counted_phase(&self) -> i32 {
+        self.squares
+            .iter()
+            .flatten()
+            .map(|piece| piece.piece_type().phase_weight())
+            .sum()
     }
 
     // the hash of the current position computed from scratch
@@ -505,6 +564,59 @@ mod tests {
             assert_eq!(board.turn(), Color::White, "after {chess_move:?}");
             assert_eq!(board.hash(), hash_before, "after {chess_move:?}");
         }
+    }
+
+    // set_square sees the king twice per move, and only the first write counts
+    #[test]
+    fn the_king_square_follows_the_king() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        board.add_piece(Piece::new(PieceType::Rook, Color::White), 7); // h1
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 60); // e8
+
+        assert_eq!(board.king_square(Color::White), Some(4));
+
+        board.make_move_from_squares(4, 6, None); // e1g1, castling short
+        assert_eq!(board.king_square(Color::White), Some(6));
+        assert_eq!(board.king_square(Color::Black), Some(60));
+
+        board.undo_move();
+        assert_eq!(board.king_square(Color::White), Some(4));
+    }
+
+    // the capture writes the taker onto the very square the king stood on
+    #[test]
+    fn a_captured_king_leaves_the_king_square_empty() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 12); // e2
+
+        board.make_move_from_squares(4, 12, None);
+
+        assert_eq!(board.king_square(Color::White), Some(12));
+        assert_eq!(board.king_square(Color::Black), None);
+
+        board.undo_move();
+        assert_eq!(board.king_square(Color::Black), Some(12));
+    }
+
+    // bxa8=Q removes a rook and adds a queen in one move
+    #[test]
+    fn the_phase_follows_a_capture_and_a_promotion() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 60); // e8
+        board.add_piece(Piece::new(PieceType::Pawn, Color::White), 49); // b7
+        board.add_piece(Piece::new(PieceType::Rook, Color::Black), 56); // a8
+
+        // kings and pawns weigh nothing, so the rook is the whole of it
+        assert_eq!(board.phase(), 2);
+
+        board.make_move_from_squares(49, 56, Some(PieceType::Queen)); // bxa8=Q
+        assert_eq!(board.phase(), 4);
+
+        board.undo_move();
+        assert_eq!(board.phase(), 2);
     }
 
     // the same position reached by two different move orders has to hash the same

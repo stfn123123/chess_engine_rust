@@ -29,16 +29,29 @@ use crate::board::square::{
 impl Board {
     // every legal move of one side, castling included
     pub(crate) fn legal_moves_for(&self, color: Color) -> Vec<Move> {
+        self.generate(color, false)
+    }
+
+    // only the moves that take something - what quiescence walks
+    pub(crate) fn legal_captures_for(&self, color: Color) -> Vec<Move> {
+        self.generate(color, true)
+    }
+
+    fn generate(&self, color: Color, captures_only: bool) -> Vec<Move> {
         // a position without a king only comes from a hand built board; there is no
         // king to keep safe, so every pseudo-legal move is as legal as it gets
         let Some(king_square) = self.king_square(color) else {
-            return self.pseudo_legal_moves(color);
+            let mut moves = self.pseudo_legal_moves(color);
+            if captures_only {
+                moves.retain(|candidate| candidate.captured.is_some());
+            }
+            return moves;
         };
 
-        // a position holds around forty moves, so one allocation covers the whole list
-        let mut moves = Vec::with_capacity(48);
+        // a position holds around forty moves, and far fewer captures
+        let mut moves = Vec::with_capacity(if captures_only { 16 } else { 48 });
         let king = Piece::new(PieceType::King, color);
-        self.king_moves(&mut moves, king, king_square);
+        self.king_moves(&mut moves, king, king_square, captures_only);
 
         let safety = self.evaluate_pins(color.opponent());
 
@@ -81,6 +94,11 @@ impl Board {
             self.moves_for_piece(&mut candidates, piece, from);
 
             for &candidate in &candidates {
+                // before the legality scan, which is the expensive half
+                if captures_only && candidate.captured.is_none() {
+                    continue;
+                }
+
                 let legal = if candidate.en_passant {
                     // the pawn it takes stands beside the square it ends on, so neither
                     // mask can judge this move - the attack scan has to
@@ -96,8 +114,8 @@ impl Board {
         }
 
         // castling out of check is never allowed; castle_moves itself refuses to castle
-        // through or into an attacked square
-        if safety.checkers.count == 0 {
+        // through or into an attacked square. A castle never takes anything
+        if !captures_only && safety.checkers.count == 0 {
             self.castle_moves(&mut moves, color);
         }
 
@@ -295,7 +313,7 @@ impl Board {
     // is about, and every step changes what the enemy reaches. The scan runs with the
     // king lifted off the board, otherwise it would block the very ray it is trying to
     // step out of and stepping straight backwards would look safe
-    fn king_moves(&self, moves: &mut Vec<Move>, king: Piece, from: u8) {
+    fn king_moves(&self, moves: &mut Vec<Move>, king: Piece, from: u8, captures_only: bool) {
         let enemy = king.color().opponent();
         let overlay = Overlay::vacating(from);
 
@@ -306,6 +324,10 @@ impl Board {
 
             let occupant = self.piece_at(to);
             if matches!(occupant, Some(piece) if piece.color() == king.color()) {
+                continue;
+            }
+            // before the attack scan, the expensive part of a king step
+            if captures_only && occupant.is_none() {
                 continue;
             }
             if self.is_attacked_over(to, enemy, overlay) {

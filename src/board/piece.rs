@@ -47,6 +47,17 @@ impl PieceType {
         }
     }
 
+    // what this piece counts towards the game phase - kings and pawns count nothing,
+    // since a board of nothing but pawns is an endgame
+    pub const fn phase_weight(self) -> i32 {
+        match self {
+            PieceType::King | PieceType::Pawn => 0,
+            PieceType::Knight | PieceType::Bishop => 1,
+            PieceType::Rook => 2,
+            PieceType::Queen => 4,
+        }
+    }
+
     // the usual algebraic letter, lowercase
     pub fn letter(self) -> char {
         match self {
@@ -74,6 +85,14 @@ impl Color {
         match self {
             Color::White => Color::Black,
             Color::Black => Color::White,
+        }
+    }
+
+    // the two sides as the rows of a table with one entry per color
+    pub fn index(self) -> usize {
+        match self {
+            Color::White => 0,
+            Color::Black => 1,
         }
     }
 

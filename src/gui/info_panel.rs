@@ -57,6 +57,7 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
                 turn_block(app, ui);
                 status_block(app, ui);
                 evaluation_block(app, ui);
+                phase_block(app, ui);
 
                 divider(ui);
                 ui.add_space(16.0);
@@ -128,6 +129,11 @@ fn evaluation_block(app: &ChessApp, ui: &mut egui::Ui) {
     };
 
     stat_block(ui, "EVALUATION (WHITE)", &value, color);
+}
+
+// the share of the opening pieces still on the board, for tuning
+fn phase_block(app: &ChessApp, ui: &mut egui::Ui) {
+    stat_block(ui, "GAME PHASE", &format!("{:.2}", app.phase), TEXT_PRIMARY);
 }
 
 // what the last search found, and what it cost, each in its own colour
