@@ -155,6 +155,8 @@ impl ChessApp {
             ("Draw - insufficient material".to_string(), Tone::Over)
         } else if self.board.is_threefold_repetition() {
             ("Draw - threefold repetition".to_string(), Tone::Over)
+        } else if self.board.is_fifty_move_draw() {
+            ("Draw - fifty move rule".to_string(), Tone::Over)
         } else if self.board.is_check(turn) {
             (format!("{turn:?} is in check"), Tone::Warning)
         } else {

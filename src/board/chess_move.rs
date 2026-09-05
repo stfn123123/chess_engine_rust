@@ -75,11 +75,13 @@ impl Move {
 
 // one entry of the board's history: the move plus the bits of state that cannot be
 // worked out from the position afterwards
+// the position key lives on its own stack instead of in here - the repetition scan
+// reads nothing but keys, and packed they fit three times as many to a cache line
 pub struct MoveRecord {
     pub chess_move: Move,
     pub castling_rights_before: CastlingRights,
     // the en passant target that was in effect before the move
     pub en_passant_before: Option<u8>,
-    // the zobrist hash of the position the move was played in, used for repetitions
-    pub hash_before: u64,
+    // the halfmove clock as it stood before the move, which a reset cannot recover
+    pub halfmove_clock_before: u16,
 }

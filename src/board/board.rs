@@ -1,7 +1,5 @@
 // The board: where the pieces stand, whose turn it is, and how a move is played
 // and taken back again. Move generation itself lives in `movegen`.
-//
-// missing feature: 50-move-rule
 
 use crate::board::castling::{CastleSide, CastlingRights, rook_castle_square, rook_start_square};
 use crate::board::chess_move::{Move, MoveRecord};
@@ -17,6 +15,12 @@ pub struct Board {
     king_squares: [Option<u8>; 2],
     // every move played so far, together with what is needed to take it back
     history: Vec<MoveRecord>,
+    // the key of every position a move was played in, oldest first - the same order as
+    // `history`, kept apart from it so the repetition scan walks nothing but keys
+    position_keys: Vec<u64>,
+    // plies since the last capture or pawn move: the 50-move counter, and also how far
+    // back a repetition could possibly reach
+    halfmove_clock: u16,
     castling_rights: CastlingRights,
     // the square a pawn skipped over with its double push, i.e. the square an enemy
     // pawn may capture onto right now - only valid for the immediately following move
@@ -42,6 +46,8 @@ impl Board {
             squares: [None; 64],
             king_squares: [None; 2],
             history: Vec::new(),
+            position_keys: Vec::new(),
+            halfmove_clock: 0,
             castling_rights,
             en_passant_target: None,
             // white to move and no en passant target contribute nothing
@@ -159,9 +165,10 @@ impl Board {
             chess_move: *chess_move,
             castling_rights_before: self.castling_rights,
             en_passant_before: self.en_passant_target,
-            // recorded before anything changes: this is the position as it was
-            hash_before: self.hash,
+            halfmove_clock_before: self.halfmove_clock,
         };
+        // read before anything changes: this is the position as it was
+        let hash_before = self.hash;
 
         let Move {
             from,
@@ -205,6 +212,14 @@ impl Board {
         self.set_castling_rights(castling_rights);
 
         self.history.push(record);
+        self.position_keys.push(hash_before);
+        // a capture or a pawn move resets it, and with it the window a repetition or
+        // the 50-move rule can reach back over
+        self.halfmove_clock = if chess_move.is_irreversible() {
+            0
+        } else {
+            self.halfmove_clock + 1
+        };
         self.flip_turn();
 
         // last, because whether the target is capturable depends on the finished
@@ -224,6 +239,16 @@ impl Board {
             "king squares drifted"
         );
         debug_assert_eq!(self.phase, self.counted_phase(), "phase drifted");
+        debug_assert_eq!(
+            self.position_keys.len(),
+            self.history.len(),
+            "key stack drifted"
+        );
+        debug_assert_eq!(
+            self.halfmove_clock,
+            self.counted_halfmove_clock(),
+            "halfmove clock drifted"
+        );
     }
 
     // plays the move going from one square to another, for callers that only have the
@@ -239,6 +264,9 @@ impl Board {
     // on `from` removes the promoted piece from the board
     pub fn undo_move(&mut self) -> Option<Move> {
         let record = self.history.pop()?;
+        self.position_keys.pop();
+        self.halfmove_clock = record.halfmove_clock_before;
+
         let chess_move = record.chess_move;
         let color = chess_move.piece.color();
 
@@ -273,6 +301,16 @@ impl Board {
             "king squares drifted"
         );
         debug_assert_eq!(self.phase, self.counted_phase(), "phase drifted");
+        debug_assert_eq!(
+            self.position_keys.len(),
+            self.history.len(),
+            "key stack drifted"
+        );
+        debug_assert_eq!(
+            self.halfmove_clock,
+            self.counted_halfmove_clock(),
+            "halfmove clock drifted"
+        );
 
         Some(chess_move)
     }
@@ -353,27 +391,91 @@ impl Board {
         }
     }
 
+    // the keys of the positions the current one could still repeat: back to the last
+    // capture or pawn move, which no earlier position can survive
+    // the halfmove clock is that distance already, so nothing has to be walked for it
+    fn reversible_keys(&self) -> &[u64] {
+        let window = (self.halfmove_clock as usize).min(self.position_keys.len());
+        &self.position_keys[self.position_keys.len() - window..]
+    }
+
+    // the positions worth comparing against, paired with how many plies back they are
+    // only every second one can match: a position repeats with the same side to move,
+    // and the side to move is part of the key
+    // it starts four plies back because that is the shortest way back to a position -
+    // both sides have to move a piece and move it back again
+    fn repetition_candidates(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.reversible_keys()
+            .iter()
+            .rev()
+            .enumerate()
+            .skip(3)
+            .step_by(2)
+            .map(|(index, &key)| (index + 1, key))
+    }
+
     // how often the current position has occurred in this game, the current one included
     pub fn position_repetitions(&self) -> usize {
-        let mut repetitions = 1;
+        if self.halfmove_clock < 4 {
+            return 1;
+        }
 
-        // walking backwards only until the last capture or pawn move is enough:
-        // no position from before such a move can ever come back
-        for record in self.history.iter().rev() {
-            if record.hash_before == self.hash {
+        let mut repetitions = 1;
+        for (_, key) in self.repetition_candidates() {
+            if key == self.hash {
                 repetitions += 1;
-            }
-            if record.chess_move.is_irreversible() {
-                break;
             }
         }
 
         repetitions
     }
 
-    // the same position has been on the board three times
+    // the same position has been on the board three times - the drawing rule itself,
+    // which is what the GUI reports a finished game with
     pub fn is_threefold_repetition(&self) -> bool {
         self.position_repetitions() >= 3
+    }
+
+    // a draw by repetition as the search should see it, `ply` plies below its root.
+    //
+    // one repetition inside the tree is already enough: the line got back to a position
+    // it had already reached, so either side can simply do it again, and waiting for a
+    // third costs four plies of depth on exactly the perpetuals that decide games.
+    // before the root the real rule applies, because that is the game being played.
+    //
+    // note that this is path dependent - the same position is a draw or not depending
+    // on how it was reached - so a score that came out of here must never be stored in
+    // a transposition table under the position key alone
+    pub fn is_repetition_draw(&self, ply: u32) -> bool {
+        if self.halfmove_clock < 4 {
+            return false;
+        }
+
+        let mut seen = 0;
+
+        for (distance, key) in self.repetition_candidates() {
+            if key != self.hash {
+                continue;
+            }
+
+            // reached within the search tree rather than in the game before it
+            if distance as u32 <= ply {
+                return true;
+            }
+
+            // the current position is the first, so two more make three
+            seen += 1;
+            if seen >= 2 {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    // fifty moves by each side with no capture and no pawn move
+    pub fn is_fifty_move_draw(&self) -> bool {
+        self.halfmove_clock >= 100
     }
 
     // neither side has enough material left to mate with: K vs K, KB vs K, KN vs K,
@@ -500,6 +602,15 @@ impl Board {
         Color::BOTH.map(|color| self.squares_with(PieceType::King, color).next())
     }
 
+    // the halfmove clock counted from scratch, for the debug_asserts to check against
+    fn counted_halfmove_clock(&self) -> u16 {
+        self.history
+            .iter()
+            .rev()
+            .take_while(|record| !record.chess_move.is_irreversible())
+            .count() as u16
+    }
+
     // the phase counted from scratch, for the debug_asserts to check against
     fn counted_phase(&self) -> i32 {
         self.squares
@@ -536,6 +647,15 @@ impl Board {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Ng1-f3 Ng8-f6 Nf3-g1 Nf6-g8: four plies that put the position back exactly as it
+    // was, which is the shortest repetition there is
+    fn shuffle_knights(board: &mut Board) {
+        board.make_move_from_squares(6, 21, None);
+        board.make_move_from_squares(62, 45, None);
+        board.make_move_from_squares(21, 6, None);
+        board.make_move_from_squares(45, 62, None);
+    }
 
     fn start_position() -> Board {
         let mut board = Board::new();
@@ -617,6 +737,111 @@ mod tests {
 
         board.undo_move();
         assert_eq!(board.phase(), 2);
+    }
+
+    // the scan steps two plies at a time and starts four back, so the one thing it must
+    // not do is step over the repetition it is looking for
+    #[test]
+    fn a_knight_shuffle_repeats_the_position() {
+        let mut board = start_position();
+        assert_eq!(board.position_repetitions(), 1);
+
+        shuffle_knights(&mut board);
+        assert_eq!(board.position_repetitions(), 2, "after one shuffle");
+
+        shuffle_knights(&mut board);
+        assert_eq!(board.position_repetitions(), 3, "after two shuffles");
+        assert!(board.is_threefold_repetition());
+    }
+
+    // a pawn move shuts the window, so the shuffle after it repeats only the position
+    // the pawns left behind - the two visits to the start position are out of reach and
+    // the scan must not count them or run back that far looking
+    #[test]
+    fn a_pawn_move_closes_the_repetition_window() {
+        let mut board = start_position();
+        shuffle_knights(&mut board);
+        assert_eq!(board.position_repetitions(), 2);
+
+        board.make_move_from_squares(12, 28, None); // e2e4
+        board.make_move_from_squares(52, 36, None); // e7e5, so white is to move again
+        assert_eq!(board.halfmove_clock, 0);
+
+        shuffle_knights(&mut board);
+        assert_eq!(board.halfmove_clock, 4);
+        assert_eq!(
+            board.reversible_keys().len(),
+            4,
+            "the scan reached past the pawn moves"
+        );
+        assert_eq!(board.position_repetitions(), 2, "the pawns are still out");
+    }
+
+    // the clock counts reversible plies and a capture puts it back to nothing
+    #[test]
+    fn the_halfmove_clock_counts_and_resets() {
+        let mut board = start_position();
+        assert_eq!(board.halfmove_clock, 0);
+
+        board.make_move_from_squares(6, 21, None); // Ng1f3
+        assert_eq!(board.halfmove_clock, 1);
+        board.make_move_from_squares(57, 42, None); // Nb8c6
+        assert_eq!(board.halfmove_clock, 2);
+
+        board.make_move_from_squares(12, 28, None); // e2e4, a pawn move
+        assert_eq!(board.halfmove_clock, 0);
+    }
+
+    // undo has to put the clock and the key stack back, or every repetition the search
+    // looks at afterwards is read off the wrong window
+    #[test]
+    fn undo_restores_the_repetition_state() {
+        let mut board = start_position();
+        shuffle_knights(&mut board);
+
+        let clock_before = board.halfmove_clock;
+        let keys_before = board.position_keys.clone();
+
+        board.make_move_from_squares(6, 21, None); // Ng1f3
+        board.undo_move();
+
+        assert_eq!(board.halfmove_clock, clock_before);
+        assert_eq!(board.position_keys, keys_before);
+    }
+
+    // the difference between the two rules: inside the search tree one repetition is a
+    // draw, before the root it takes three
+    #[test]
+    fn the_search_draws_on_a_repetition_the_rules_would_not() {
+        let mut board = start_position();
+        shuffle_knights(&mut board);
+
+        // the search played all four plies, so it can see it got back here itself
+        assert!(board.is_repetition_draw(4));
+
+        // only three of them are inside the tree: the repetition reaches past the root,
+        // where twofold is just a position that has occurred before
+        assert!(!board.is_repetition_draw(3));
+        assert!(!board.is_threefold_repetition());
+
+        // a third occurrence is a draw wherever the root is
+        shuffle_knights(&mut board);
+        assert!(board.is_repetition_draw(0));
+        assert!(board.is_threefold_repetition());
+    }
+
+    // a hundred reversible plies with nothing captured and no pawn moved
+    #[test]
+    fn fifty_moves_by_each_side_is_a_draw() {
+        let mut board = start_position();
+        assert!(!board.is_fifty_move_draw());
+
+        for _ in 0..25 {
+            shuffle_knights(&mut board);
+        }
+
+        assert_eq!(board.halfmove_clock, 100);
+        assert!(board.is_fifty_move_draw());
     }
 
     // the same position reached by two different move orders has to hash the same

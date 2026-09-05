@@ -1,7 +1,7 @@
 // The two sides and the pieces they own.
 //
 // A Piece is packed into a single byte: the low three bits are the piece type,
-// the next two are the color. That keeps a piece Copy-cheap and lets the byte be
+// the fourth is the color. That keeps a piece Copy-cheap and lets the byte be
 // used directly as an index into the zobrist tables.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -71,11 +71,12 @@ impl PieceType {
     }
 }
 
-// the discriminants are the color bits stored inside a Piece
+// the discriminants are the color bit stored inside a Piece - white is 0 so that the
+// packed byte stays small enough to index the zobrist table directly
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Color {
-    White = 8,
-    Black = 16,
+    White = 0,
+    Black = 8,
 }
 
 impl Color {
@@ -129,16 +130,16 @@ impl Color {
     }
 }
 
-const TYPE_MASK: u8 = 0b00111;
-const COLOR_MASK: u8 = 0b11000;
+const TYPE_MASK: u8 = 0b0111;
+const COLOR_MASK: u8 = 0b1000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Piece(u8);
 
 impl Piece {
-    // the biggest packed value is Queen | Black = 6 | 16 = 22, so a table indexed by
-    // the raw byte needs 23 rows - a few unused ones in exchange for no mapping step
-    pub const ZOBRIST_INDEX_COUNT: usize = 23;
+    // the biggest packed value is Queen | Black = 6 | 8 = 14, so a table indexed by the
+    // raw byte needs 15 rows - three unused ones in exchange for no mapping step
+    pub const ZOBRIST_INDEX_COUNT: usize = 15;
 
     pub const fn new(piece_type: PieceType, color: Color) -> Self {
         Piece(piece_type as u8 | color as u8)
@@ -179,5 +180,46 @@ impl Piece {
 impl std::fmt::Debug for Piece {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.symbol())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // the packing pays for itself by being the zobrist row index straight off, which
+    // only holds while every piece lands on a row of its own inside the table
+    #[test]
+    fn every_piece_indexes_a_zobrist_row_of_its_own() {
+        let mut seen = Vec::new();
+
+        for piece_type in PieceType::ALL {
+            for color in Color::BOTH {
+                let index = Piece::new(piece_type, color).zobrist_index();
+
+                assert!(
+                    index < Piece::ZOBRIST_INDEX_COUNT,
+                    "{piece_type:?} {color:?} wants row {index}"
+                );
+                assert!(
+                    !seen.contains(&index),
+                    "{piece_type:?} {color:?} shares row {index}"
+                );
+                seen.push(index);
+            }
+        }
+    }
+
+    // what a mask that is a bit too wide or too narrow breaks first
+    #[test]
+    fn a_packed_piece_unpacks_again() {
+        for piece_type in PieceType::ALL {
+            for color in Color::BOTH {
+                let piece = Piece::new(piece_type, color);
+
+                assert_eq!(piece.piece_type(), piece_type);
+                assert_eq!(piece.color(), color);
+            }
+        }
     }
 }

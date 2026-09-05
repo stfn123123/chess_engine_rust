@@ -100,11 +100,10 @@ fn alpha_beta(
 ) -> i32 {
     *positions_searched += 1;
 
-    // a position that has stood on the board three times is a draw whatever the
-    // pieces say, and it is the moves played to get here that make it one - so the
-    // search is the only place that can see it, and it holds at every node rather
-    // than only at the ones it stops on
-    if board.is_threefold_repetition() {
+    // a repeated position is a draw whatever the pieces say, and it is the moves played
+    // to get here that make it one - so the search is the only place that can see it,
+    // and it holds at every node rather than only at the ones it stops on
+    if board.is_repetition_draw(ply) {
         return 0;
     }
 
@@ -116,6 +115,12 @@ fn alpha_beta(
     let moves = board.legal_moves();
     if moves.is_empty() {
         return terminal_score(board, ply);
+    }
+
+    // asked only once there is a move to make: a mate delivered on the last ply of the
+    // fifty ends the game as a mate, not as a draw
+    if board.is_fifty_move_draw() {
+        return 0;
     }
 
     for chess_move in moves {
@@ -299,7 +304,9 @@ mod tests {
 
     // plain negamax, no window and no cutoffs: the answer alpha-beta has to match
     fn negamax(board: &mut Board, depth: u32, ply: u32) -> i32 {
-        if ply > 0 && board.is_threefold_repetition() {
+        // the draw rules have to be read exactly as alpha_beta reads them, or the two
+        // disagree about scores that have nothing to do with pruning
+        if ply > 0 && board.is_repetition_draw(ply) {
             return 0;
         }
 
@@ -311,6 +318,10 @@ mod tests {
         let moves = board.legal_moves();
         if moves.is_empty() {
             return terminal_score(board, ply);
+        }
+
+        if board.is_fifty_move_draw() {
+            return 0;
         }
 
         let mut best = -INFINITY;
