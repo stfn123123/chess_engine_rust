@@ -36,6 +36,12 @@ struct SearchStats {
     // what the search thinks the position is worth, from white's point of view
     score: i32,
     positions_searched: u64,
+    // how many of those the transposition table answered without searching them
+    table_cutoffs: u64,
+    // how much of the table has been written, 0.0 to 1.0
+    table_fill: f32,
+    // whether the move came out of the opening book rather than out of a search
+    from_book: bool,
     duration: Duration,
 }
 
@@ -68,6 +74,9 @@ enum Tone {
 pub struct ChessApp {
     board: Board,
     settings: Settings,
+    // the engine, kept across moves: its transposition table is worth more the longer
+    // it has been filling up, and the game is one position after another
+    engine: search::Search,
     // the square the player picked a piece up from, if any
     selected: Option<u8>,
     // where that piece may legally go, so the board can mark those squares
@@ -106,9 +115,16 @@ impl ChessApp {
         let mut board = Board::new();
         board.set_start_position();
 
+        let engine = if settings.use_opening_book {
+            search::Search::new(settings.table_megabytes)
+        } else {
+            search::Search::without_book(settings.table_megabytes)
+        };
+
         let mut app = ChessApp {
             board,
             settings,
+            engine,
             selected: None,
             legal_targets: Vec::new(),
             status: String::new(),
@@ -239,7 +255,7 @@ impl ChessApp {
     fn run_search(&mut self) {
         let depth = self.settings.search_depth;
         let start = Instant::now();
-        let result = search::find_best_move(&mut self.board, depth);
+        let result = self.engine.find_best_move(&mut self.board, depth);
         let duration = start.elapsed();
 
         self.last_search = Some(SearchStats {
@@ -247,6 +263,9 @@ impl ChessApp {
             best_move: result.best_move,
             score: self.white_view(result.score),
             positions_searched: result.positions_searched,
+            table_cutoffs: result.table_cutoffs,
+            table_fill: result.table_fill,
+            from_book: result.from_book,
             duration,
         });
     }

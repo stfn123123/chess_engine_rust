@@ -1,18 +1,14 @@
-# Goals / Todo
-
-## Evaluation
-
 ## Search
-- transposition table
-  - storing information:
-  - Zobrist Key
-  - best move done
-  - depth
-  - score
-  - Type of Node (exact, upper bound, lower bound)
+- indicate how many positions where search thorugh quiescience
 - iterative deepening + adding time needed for it to work
-
+- move ordering
+  - idea: look at pieces positions and their psqt tables. prioritize pieces, that are on a negative psqt table entry.
+  - goal: move pieces from bad spots to good spots.
+  - 
 ## Performance
+- save all pieces positions?
+- piece centric board, no downsides in MY current implementation?
+
 - MoveOrder (search.rs, ~60 lines) could be one line instead: `moves.sort_by_cached_key(|m| -move_score(board, m))`.
 Both score every move once, which is where ~90% of the win over the old sort_unstable_by_key came from. The
 one-liner allocates a Vec per node and orders moves the search never reaches; MoveOrder uses a stack array and

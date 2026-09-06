@@ -175,13 +175,21 @@ fn search_blocks(app: &ChessApp, ui: &mut egui::Ui) {
         None => "-".to_string(),
     };
 
-    stat_block(
-        ui,
-        &format!("BEST MOVE AT DEPTH {}", stats.depth),
-        &best_move,
-        ACCENT,
-    );
-    stat_block(ui, "SCORE (WHITE)", &format_score(stats.score), STAT_EVAL);
+    // a book move was not searched for, so it has no depth and no score to show, and
+    // the counts below it are all zero because nothing was done to run them up
+    let heading = if stats.from_book {
+        "BOOK MOVE".to_string()
+    } else {
+        format!("BEST MOVE AT DEPTH {}", stats.depth)
+    };
+    let score = if stats.from_book {
+        "-".to_string()
+    } else {
+        format_score(stats.score)
+    };
+
+    stat_block(ui, &heading, &best_move, ACCENT);
+    stat_block(ui, "SCORE (WHITE)", &score, STAT_EVAL);
     stat_block(
         ui,
         "POSITIONS SEARCHED",
@@ -199,6 +207,20 @@ fn search_blocks(app: &ChessApp, ui: &mut egui::Ui) {
         "POSITIONS / SEC",
         &format_count(positions_per_second as u64),
         STAT_SPEED,
+    );
+    // what the transposition table saved, and how full it is: once the fill nears
+    // 100% the table is throwing away as much as it keeps
+    stat_block(
+        ui,
+        "TABLE CUTOFFS",
+        &format_count(stats.table_cutoffs),
+        STAT_EVAL,
+    );
+    stat_block(
+        ui,
+        "TABLE FILL",
+        &format!("{:.1}%", stats.table_fill * 100.0),
+        TEXT_MUTED,
     );
 }
 
