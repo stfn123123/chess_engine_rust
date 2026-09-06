@@ -3,7 +3,6 @@
 ## Evaluation
 
 ## Search
-- improve Zobrist (TESTING)
 - transposition table
   - storing information:
   - Zobrist Key
@@ -11,6 +10,7 @@
   - depth
   - score
   - Type of Node (exact, upper bound, lower bound)
+- iterative deepening + adding time needed for it to work
 
 ## Performance
 - MoveOrder (search.rs, ~60 lines) could be one line instead: `moves.sort_by_cached_key(|m| -move_score(board, m))`.
@@ -25,16 +25,11 @@ exactly like the zobrist hash and the king squares. That removes the 64-square w
 Worth doing after the weights change, and it's the same pattern you've already got twice.
 
 ## Gameplay
-- add a time
 - add different time modes and increment
 - add bot vs bot, bot vs player
 
-## Search
-- iterative deepening
-
 ## Connect to Lichess
 - using the api
-
 
 # Performance results
 - PSQT, without saving the king for efficiency, no Quiescience: 2.5M to 2.9M

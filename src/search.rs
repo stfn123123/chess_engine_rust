@@ -363,7 +363,6 @@ fn optimistic_gain(chess_move: &Move) -> i32 {
 
 // how many positions are `depth` plies away - the check that move generation is
 // right, not part of playing a game
-#[allow(dead_code)]
 pub fn count_positions(board: &mut Board, depth: u32) -> u64 {
     if depth == 0 {
         return 1;

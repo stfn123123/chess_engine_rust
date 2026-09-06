@@ -12,9 +12,7 @@ use super::theme::{
     TEXT_MUTED, TEXT_PRIMARY, WARNING, WHITE_SIDE,
 };
 use super::{ChessApp, Tone};
-use crate::board::chess_move::Move;
 use crate::board::piece::Color;
-use crate::board::square::{file_of, rank_of};
 use crate::evaluate::MATE;
 
 pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
@@ -173,7 +171,7 @@ fn search_blocks(app: &ChessApp, ui: &mut egui::Ui) {
     };
 
     let best_move = match &stats.best_move {
-        Some(chess_move) => format_move(chess_move),
+        Some(chess_move) => chess_move.coordinates(),
         None => "-".to_string(),
     };
 
@@ -244,9 +242,54 @@ fn testing_blocks(app: &mut ChessApp, ui: &mut egui::Ui) {
     ) {
         app.store_position();
     }
+    ui.add_space(6.0);
+
+    perft_block(app, ui, full_width);
     ui.add_space(16.0);
 
     saved_positions_block(app, ui);
+}
+
+// counting every position a given number of plies away, for checking move generation
+// against the published perft numbers - the depth sits next to the button, because it
+// is the one thing about this run that is worth changing between clicks
+fn perft_block(app: &mut ChessApp, ui: &mut egui::Ui, full_width: f32) {
+    let mut run = false;
+
+    ui.horizontal(|ui| {
+        let field = 56.0;
+        let gap = ui.spacing().item_spacing.x;
+        let rest = (full_width - field - gap).max(0.0);
+
+        // dragged or typed into, and capped where a count still finishes in a moment
+        ui.add_sized(
+            [field, 34.0],
+            egui::DragValue::new(&mut app.perft_depth).range(1..=8),
+        );
+        run = panel_button(ui, "Count Positions", ACCENT, egui::vec2(rest, 34.0));
+    });
+
+    // read out of the app before the click is answered, so what is drawn is the count
+    // that was on screen when the button was pressed
+    let last = app
+        .last_perft
+        .as_ref()
+        .map(|perft| (perft.depth, perft.positions, perft.duration));
+
+    if let Some((depth, positions, duration)) = last {
+        ui.add_space(14.0);
+        stat_block(
+            ui,
+            &format!("POSITIONS AT DEPTH {depth}"),
+            &format_count(positions),
+            TEXT_PRIMARY,
+        );
+        stat_block(ui, "COUNT TIME", &format_duration(duration), STAT_TIME);
+    }
+
+    if run {
+        app.count_positions();
+    }
 }
 
 // the stored positions, one row each: the label recalls it, the cross forgets it
@@ -356,28 +399,6 @@ fn format_count(count: u64) -> String {
         out.push(digit);
     }
     out.chars().rev().collect()
-}
-
-// a move as the two squares it goes between, e.g. "e2e4", with the promoted piece
-// after them when there is one
-fn format_move(chess_move: &Move) -> String {
-    let mut text = format!(
-        "{}{}",
-        square_name(chess_move.from),
-        square_name(chess_move.to)
-    );
-
-    if let Some(promotion) = chess_move.promotion {
-        text.push(promotion.letter());
-    }
-
-    text
-}
-
-fn square_name(square: u8) -> String {
-    let file = (b'a' + file_of(square)) as char;
-    let rank = (b'1' + rank_of(square)) as char;
-    format!("{file}{rank}")
 }
 
 // a search score: a mate reads as the number of moves until it, everything else as

@@ -8,6 +8,7 @@
 
 mod board_view;
 mod info_panel;
+mod storage;
 mod theme;
 
 use eframe::egui;
@@ -35,6 +36,13 @@ struct SearchStats {
     // what the search thinks the position is worth, from white's point of view
     score: i32,
     positions_searched: u64,
+    duration: Duration,
+}
+
+// what a position count found, and what it cost
+struct PerftStats {
+    depth: u32,
+    positions: u64,
     duration: Duration,
 }
 
@@ -72,6 +80,10 @@ pub struct ChessApp {
     // how late the game is: 1.00 on the opening board, 0.00 once the pieces are off
     phase: f32,
     last_search: Option<SearchStats>,
+    // how deep the next position count goes, set in the panel
+    perft_depth: u32,
+    // what the last position count found, dropped as soon as the board changes
+    last_perft: Option<PerftStats>,
     // whether the engine weighs and searches after every move - turned off, a position
     // can be set up a move at a time without waiting for a search at every click
     analysis_enabled: bool,
@@ -81,7 +93,7 @@ pub struct ChessApp {
 
 impl ChessApp {
     fn new(settings: Settings) -> Self {
-        ChessApp::with_state(settings, true, Vec::new())
+        ChessApp::with_state(settings, true, storage::load())
     }
 
     // a fresh game that keeps what belongs to the session rather than to the game:
@@ -104,6 +116,8 @@ impl ChessApp {
             evaluation: None,
             phase: 1.0,
             last_search: None,
+            perft_depth: 4,
+            last_perft: None,
             analysis_enabled,
             saved_positions,
         };
@@ -126,6 +140,8 @@ impl ChessApp {
     // game is still running
     fn position_changed(&mut self) {
         self.refresh_status();
+        // the old count belongs to the position that was on the board before this one
+        self.last_perft = None;
         // the phase is a property of the position rather than a verdict on it, so it
         // stays up to date even with the engine turned off
         self.phase = game_phase_of(&self.board);
@@ -182,6 +198,7 @@ impl ChessApp {
             board: self.board.clone(),
             label: format!("#{} {side} - {pieces}p", self.saved_positions.len() + 1),
         });
+        storage::save(&self.saved_positions);
     }
 
     // puts a stored position back on the board; the labels keep the numbers they were
@@ -203,6 +220,7 @@ impl ChessApp {
     fn forget_position(&mut self, index: usize) {
         if index < self.saved_positions.len() {
             self.saved_positions.remove(index);
+            storage::save(&self.saved_positions);
         }
     }
 
@@ -229,6 +247,21 @@ impl ChessApp {
             best_move: result.best_move,
             score: self.white_view(result.score),
             positions_searched: result.positions_searched,
+            duration,
+        });
+    }
+
+    // counts every position `perft_depth` plies away from the board as it stands, to
+    // check move generation against the published perft numbers
+    fn count_positions(&mut self) {
+        let depth = self.perft_depth;
+        let start = Instant::now();
+        let positions = search::count_positions(&mut self.board, depth);
+        let duration = start.elapsed();
+
+        self.last_perft = Some(PerftStats {
+            depth,
+            positions,
             duration,
         });
     }

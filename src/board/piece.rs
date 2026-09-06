@@ -59,6 +59,13 @@ impl PieceType {
     }
 
     // the usual algebraic letter, lowercase
+    // the type a letter stands for, as `letter` writes it
+    pub fn from_letter(letter: char) -> Option<PieceType> {
+        PieceType::ALL
+            .into_iter()
+            .find(|piece_type| piece_type.letter() == letter)
+    }
+
     pub fn letter(self) -> char {
         match self {
             PieceType::King => 'k',

@@ -17,6 +17,25 @@ pub fn rank_of(square: u8) -> u8 {
     square / 8
 }
 
+// a square as it is written down, e.g. 4 -> "e1"
+pub fn square_name(square: u8) -> String {
+    let file = (b'a' + file_of(square)) as char;
+    let rank = (b'1' + rank_of(square)) as char;
+    format!("{file}{rank}")
+}
+
+// the square a name like "e1" stands for, or None when it is not one
+pub fn square_from_name(text: &str) -> Option<u8> {
+    let bytes = text.as_bytes();
+    let [file, rank] = bytes else { return None };
+
+    if !(b'a'..=b'h').contains(file) || !(b'1'..=b'8').contains(rank) {
+        return None;
+    }
+
+    Some((rank - b'1') * 8 + (file - b'a'))
+}
+
 // the square at (file, rank), or None when that is off the board
 pub fn square_at(file: i8, rank: i8) -> Option<u8> {
     if (0..8).contains(&file) && (0..8).contains(&rank) {

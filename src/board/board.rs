@@ -143,6 +143,12 @@ impl Board {
             })
     }
 
+    // every move played so far, oldest first - a position is written down as the moves
+    // that lead to it, so replaying them brings it back with its history intact
+    pub fn moves_played(&self) -> Vec<Move> {
+        self.history.iter().map(|record| record.chess_move).collect()
+    }
+
     #[allow(dead_code)]
     pub fn display(&self) {
         for rank in (0..8).rev() {

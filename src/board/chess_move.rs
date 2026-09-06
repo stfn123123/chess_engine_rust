@@ -6,6 +6,7 @@
 
 use crate::board::castling::{CastleSide, CastlingRights};
 use crate::board::piece::{Piece, PieceType};
+use crate::board::square::{square_from_name, square_name};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Move {
@@ -66,11 +67,41 @@ impl Move {
         }
     }
 
+    // the move as the two squares it goes between, e.g. "e2e4", with the promoted
+    // piece after them when there is one - how a move is shown and written down
+    pub fn coordinates(&self) -> String {
+        let mut text = format!("{}{}", square_name(self.from), square_name(self.to));
+
+        if let Some(promotion) = self.promotion {
+            text.push(promotion.letter());
+        }
+
+        text
+    }
+
     // a move after which no earlier position can ever show up again
     // (the same rule the 50-move counter resets on)
     pub fn is_irreversible(&self) -> bool {
         self.captured.is_some() || self.piece.is(PieceType::Pawn)
     }
+}
+
+// the two squares and the promotion in a move written the way `coordinates` writes
+// it - the piece it moves is not in there, so only a board can turn this into a Move
+pub fn parse_coordinates(text: &str) -> Option<(u8, u8, Option<PieceType>)> {
+    // the byte slices below only line up with characters while this holds
+    if !text.is_ascii() || (text.len() != 4 && text.len() != 5) {
+        return None;
+    }
+
+    let from = square_from_name(&text[0..2])?;
+    let to = square_from_name(&text[2..4])?;
+    let promotion = match text.chars().nth(4) {
+        Some(letter) => Some(PieceType::from_letter(letter)?),
+        None => None,
+    };
+
+    Some((from, to, promotion))
 }
 
 // one entry of the board's history: the move plus the bits of state that cannot be
