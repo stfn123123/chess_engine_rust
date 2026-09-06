@@ -7,6 +7,9 @@ use crate::board::piece::{Color, Piece, PieceType};
 use crate::board::square::{en_passant_captured_square, file_of, offset, rank_of};
 use crate::board::zobrist::ZOBRIST;
 
+// cloned to put a position aside and come back to it later, history and all - the
+// GUI stores test positions that way
+#[derive(Clone)]
 pub struct Board {
     turn: Color,
     squares: [Option<Piece>; 64],

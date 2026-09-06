@@ -64,6 +64,11 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
 
                 search_blocks(app, ui);
 
+                divider(ui);
+                ui.add_space(16.0);
+
+                testing_blocks(app, ui);
+
                 ui.add_space(4.0);
                 if new_game_button(ui) {
                     app.reset();
@@ -124,6 +129,8 @@ fn status_block(app: &ChessApp, ui: &mut egui::Ui) {
 fn evaluation_block(app: &ChessApp, ui: &mut egui::Ui) {
     let (value, color) = match app.evaluation {
         Some(score) => (format_evaluation(score), STAT_EVAL),
+        // nothing was worked out for this position, because the engine is turned off
+        None if !app.analysis_enabled => ("off".to_string(), TEXT_MUTED),
         // the game is over, so the status line above is the whole story
         None => ("-".to_string(), TEXT_MUTED),
     };
@@ -147,11 +154,13 @@ fn search_blocks(app: &ChessApp, ui: &mut egui::Ui) {
     ui.add_space(14.0);
 
     let Some(stats) = &app.last_search else {
-        ui.label(
-            egui::RichText::new("No search run yet")
-                .size(13.0)
-                .color(TEXT_MUTED),
-        );
+        let hint = if app.analysis_enabled {
+            "No search run yet"
+        } else {
+            "Evaluation is off - Run Search does one"
+        };
+
+        ui.label(egui::RichText::new(hint).size(13.0).color(TEXT_MUTED));
         ui.add_space(18.0);
         return;
     };
@@ -195,12 +204,119 @@ fn search_blocks(app: &ChessApp, ui: &mut egui::Ui) {
     );
 }
 
+// turning the engine off and on, running it by hand, and the positions put aside to
+// come back to - everything that is about testing rather than about playing
+fn testing_blocks(app: &mut ChessApp, ui: &mut egui::Ui) {
+    ui.label(
+        egui::RichText::new("TESTING")
+            .size(12.0)
+            .strong()
+            .color(ACCENT),
+    );
+    ui.add_space(14.0);
+
+    let full_width = ui.available_width();
+
+    // the state it is in now, not the state a click would put it in - a button reading
+    // "Off" while the engine is running would be read as a label, not as a switch
+    let (toggle, toggle_color) = match app.analysis_enabled {
+        true => ("Evaluation: On", CALM),
+        false => ("Evaluation: Off", TEXT_MUTED),
+    };
+
+    if panel_button(ui, toggle, toggle_color, egui::vec2(full_width, 34.0)) {
+        app.set_analysis(!app.analysis_enabled);
+    }
+    ui.add_space(6.0);
+
+    // one run whatever the toggle says: with the engine off this is the only way to
+    // search, and with it on it searches the same position again, for a second timing
+    if panel_button(ui, "Run Search", ACCENT, egui::vec2(full_width, 34.0)) {
+        app.analyse_once();
+    }
+    ui.add_space(6.0);
+
+    if panel_button(
+        ui,
+        "Store Position",
+        TEXT_PRIMARY,
+        egui::vec2(full_width, 34.0),
+    ) {
+        app.store_position();
+    }
+    ui.add_space(16.0);
+
+    saved_positions_block(app, ui);
+}
+
+// the stored positions, one row each: the label recalls it, the cross forgets it
+fn saved_positions_block(app: &mut ChessApp, ui: &mut egui::Ui) {
+    label(ui, "STORED POSITIONS");
+    ui.add_space(6.0);
+
+    if app.saved_positions.is_empty() {
+        ui.label(
+            egui::RichText::new("Nothing stored yet")
+                .size(13.0)
+                .color(TEXT_MUTED),
+        );
+        ui.add_space(18.0);
+        return;
+    }
+
+    // which row was clicked, decided while the list is only being read - recalling or
+    // forgetting one on the spot would be changing the list that is being walked
+    let mut recall = None;
+    let mut forget = None;
+
+    for (index, saved) in app.saved_positions.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let cross = 28.0;
+            let gap = ui.spacing().item_spacing.x;
+            let rest = (ui.available_width() - cross - gap).max(0.0);
+
+            if panel_button(ui, &saved.label, TEXT_PRIMARY, egui::vec2(rest, 28.0)) {
+                recall = Some(index);
+            }
+            if panel_button(ui, "\u{00d7}", DANGER, egui::vec2(cross, 28.0)) {
+                forget = Some(index);
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    ui.add_space(14.0);
+
+    if let Some(index) = recall {
+        app.recall_position(index);
+    }
+    if let Some(index) = forget {
+        app.forget_position(index);
+    }
+}
+
 fn new_game_button(ui: &mut egui::Ui) -> bool {
-    let button = egui::Button::new(egui::RichText::new("New Game").size(14.0).color(TEXT_PRIMARY))
+    panel_button(
+        ui,
+        "New Game",
+        TEXT_PRIMARY,
+        egui::vec2(ui.available_width(), 34.0),
+    )
+}
+
+// the panel's button, in the one shape they all share - the text colour is the only
+// thing that varies, so a toggle can read on or off at a glance
+fn panel_button(
+    ui: &mut egui::Ui,
+    text: &str,
+    text_color: egui::Color32,
+    size: egui::Vec2,
+) -> bool {
+    let button = egui::Button::new(egui::RichText::new(text).size(14.0).color(text_color))
         .fill(PANEL_BG)
         .stroke(egui::Stroke::new(1.0, PANEL_BORDER))
         .corner_radius(6.0)
-        .min_size(egui::vec2(ui.available_width(), 34.0));
+        .min_size(size);
 
     ui.add(button).clicked()
 }

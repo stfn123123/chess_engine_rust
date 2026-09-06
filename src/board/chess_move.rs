@@ -77,6 +77,7 @@ impl Move {
 // worked out from the position afterwards
 // the position key lives on its own stack instead of in here - the repetition scan
 // reads nothing but keys, and packed they fit three times as many to a cache line
+#[derive(Clone)]
 pub struct MoveRecord {
     pub chess_move: Move,
     pub castling_rights_before: CastlingRights,

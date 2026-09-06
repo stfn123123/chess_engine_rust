@@ -38,6 +38,14 @@ struct SearchStats {
     duration: Duration,
 }
 
+// a position put aside from the panel, to come back to later
+struct SavedPosition {
+    // the whole board, history included, so a recalled position can be played on
+    board: Board,
+    // what the row in the panel reads, e.g. "#1 White - 32p"
+    label: String,
+}
+
 // how urgently a status line should read
 #[derive(Clone, Copy, PartialEq)]
 enum Tone {
@@ -64,10 +72,25 @@ pub struct ChessApp {
     // how late the game is: 1.00 on the opening board, 0.00 once the pieces are off
     phase: f32,
     last_search: Option<SearchStats>,
+    // whether the engine weighs and searches after every move - turned off, a position
+    // can be set up a move at a time without waiting for a search at every click
+    analysis_enabled: bool,
+    // positions put aside to come back to, oldest first
+    saved_positions: Vec<SavedPosition>,
 }
 
 impl ChessApp {
     fn new(settings: Settings) -> Self {
+        ChessApp::with_state(settings, true, Vec::new())
+    }
+
+    // a fresh game that keeps what belongs to the session rather than to the game:
+    // the analysis toggle and the positions put aside so far
+    fn with_state(
+        settings: Settings,
+        analysis_enabled: bool,
+        saved_positions: Vec<SavedPosition>,
+    ) -> Self {
         let mut board = Board::new();
         board.set_start_position();
 
@@ -81,13 +104,16 @@ impl ChessApp {
             evaluation: None,
             phase: 1.0,
             last_search: None,
+            analysis_enabled,
+            saved_positions,
         };
         app.position_changed();
         app
     }
 
     fn reset(&mut self) {
-        *self = ChessApp::new(self.settings);
+        let saved = std::mem::take(&mut self.saved_positions);
+        *self = ChessApp::with_state(self.settings, self.analysis_enabled, saved);
     }
 
     // the game has ended, so no more moves are taken
@@ -100,19 +126,84 @@ impl ChessApp {
     // game is still running
     fn position_changed(&mut self) {
         self.refresh_status();
+        // the phase is a property of the position rather than a verdict on it, so it
+        // stays up to date even with the engine turned off
+        self.phase = game_phase_of(&self.board);
+        self.refresh_analysis();
+    }
+
+    // what the engine has to say about the position, or nothing at all when it is
+    // turned off - the old numbers are dropped rather than left standing, so nothing
+    // on screen ever belongs to a position other than the one on the board
+    fn refresh_analysis(&mut self) {
+        if !self.analysis_enabled {
+            self.evaluation = None;
+            self.last_search = None;
+            return;
+        }
+
+        self.analyse_once();
+    }
+
+    // one run of the engine on the position as it stands, whatever the toggle says
+    fn analyse_once(&mut self) {
         self.refresh_evaluation();
         self.run_search();
     }
 
     // weighs the position as it now stands
     fn refresh_evaluation(&mut self) {
-        self.phase = game_phase_of(&self.board);
-
         self.evaluation = if self.game_over() {
             None
         } else {
             Some(self.white_view(evaluate(&self.board)))
         };
+    }
+
+    // turning the engine back on brings it up to date with the board straight away,
+    // rather than waiting for the next move to be played
+    fn set_analysis(&mut self, enabled: bool) {
+        self.analysis_enabled = enabled;
+        self.refresh_analysis();
+    }
+
+    // puts the position aside, history and all, so it can be come back to and played
+    // on from exactly here
+    fn store_position(&mut self) {
+        let pieces = (0..64)
+            .filter(|&square| self.board.piece_at(square).is_some())
+            .count();
+        let side = match self.board.turn() {
+            Color::White => "White",
+            Color::Black => "Black",
+        };
+
+        self.saved_positions.push(SavedPosition {
+            board: self.board.clone(),
+            label: format!("#{} {side} - {pieces}p", self.saved_positions.len() + 1),
+        });
+    }
+
+    // puts a stored position back on the board; the labels keep the numbers they were
+    // stored with, so recalling one does not renumber the rest
+    fn recall_position(&mut self, index: usize) {
+        let Some(board) = self
+            .saved_positions
+            .get(index)
+            .map(|saved| saved.board.clone())
+        else {
+            return;
+        };
+
+        self.board = board;
+        self.clear_selection();
+        self.position_changed();
+    }
+
+    fn forget_position(&mut self, index: usize) {
+        if index < self.saved_positions.len() {
+            self.saved_positions.remove(index);
+        }
     }
 
     // the search and the evaluation both score for the side to move, the panel shows

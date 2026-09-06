@@ -11,6 +11,9 @@
 // it need not be looked at. The cutoff changes nothing about the move that comes
 // out - it only saves work.
 //
+// How early the cutoff comes is down to the order the moves are tried in, which is
+// what MoveOrder is for: it guesses at the good ones and hands them out first.
+//
 // The depth asked for is only where the full move list stops - quiescence carries on
 // with captures from there, so no line is scored in the middle of a trade.
 //
@@ -20,13 +23,18 @@
 
 use crate::board::Board;
 use crate::board::chess_move::Move;
-use crate::board::piece::PieceType;
+use crate::board::piece::{Color, PieceType};
+use crate::board::square::offset;
 use crate::evaluate::{MATE, evaluate, piece_value};
 
 // how deep the search runs unless something asks for another depth
-pub const DEFAULT_DEPTH: u32 = 4;
+pub const DEFAULT_DEPTH: u32 = 6;
 
 const INFINITY: i32 = 1_000_000;
+
+// the most moves a position has ever been found to allow is 218, so a list never
+// outgrows this - it is the size of the score buffer the ordering picks out of
+const MAX_MOVES: usize = 256;
 
 // how far short of alpha a capture may fall and still be worth looking at - covers
 // the piece-square swing of both pieces, which is not known before the move is played
@@ -68,7 +76,7 @@ pub fn find_best_move(board: &mut Board, depth: u32) -> SearchResult {
 
     let mut alpha = -INFINITY;
 
-    for chess_move in moves {
+    for chess_move in MoveOrder::new(board, moves) {
         board.make_move(&chess_move);
         let score = -alpha_beta(
             board,
@@ -123,7 +131,7 @@ fn alpha_beta(
         return 0;
     }
 
-    for chess_move in moves {
+    for chess_move in MoveOrder::new(board, moves) {
         board.make_move(&chess_move);
         let score = -alpha_beta(board, depth - 1, -beta, -alpha, ply + 1, positions_searched);
         board.undo_move();
@@ -138,6 +146,115 @@ fn alpha_beta(
     }
 
     alpha
+}
+
+// The moves of one node, handed out best first.
+//
+// Nothing is sorted. Every move is scored once up front, and each `next` walks what
+// is left over for the best of it - a selection sort that stops when the caller
+// stops asking. Most nodes cut off after a move or two, and a sort would have put
+// the whole list in order to get there.
+struct MoveOrder {
+    moves: Vec<Move>,
+    // scored in the same order as `moves`, and swapped along with them
+    // an array rather than a Vec: this is built at every node, and a Vec here would
+    // be an allocation at every node
+    scores: [i32; MAX_MOVES],
+    handed_out: usize,
+}
+
+impl MoveOrder {
+    // the full move list, scored on everything move_score knows
+    fn new(board: &Board, moves: Vec<Move>) -> MoveOrder {
+        let mut scores = [0; MAX_MOVES];
+        for (index, chess_move) in moves.iter().enumerate() {
+            scores[index] = move_score(board, chess_move);
+        }
+
+        MoveOrder {
+            moves,
+            scores,
+            handed_out: 0,
+        }
+    }
+
+    // what quiescence walks: captures, with nothing but MVV-LVA to tell them apart
+    fn captures(captures: Vec<Move>) -> MoveOrder {
+        let mut scores = [0; MAX_MOVES];
+        for (index, chess_move) in captures.iter().enumerate() {
+            scores[index] = capture_score(chess_move);
+        }
+
+        MoveOrder {
+            moves: captures,
+            scores,
+            handed_out: 0,
+        }
+    }
+}
+
+impl Iterator for MoveOrder {
+    type Item = Move;
+
+    fn next(&mut self) -> Option<Move> {
+        let slot = self.handed_out;
+        if slot >= self.moves.len() {
+            return None;
+        }
+
+        // the best of what is left, brought to the front of it
+        let mut best = slot;
+        for index in slot + 1..self.moves.len() {
+            if self.scores[index] > self.scores[best] {
+                best = index;
+            }
+        }
+        self.moves.swap(slot, best);
+        self.scores.swap(slot, best);
+
+        self.handed_out += 1;
+        Some(self.moves[slot])
+    }
+}
+
+// what a move looks worth without playing it, in centipawns
+fn move_score(board: &Board, chess_move: &Move) -> i32 {
+    let mut score = 0;
+    let moved = chess_move.piece.piece_type();
+
+    // MVV-LVA: take the most valuable piece with the least valuable one, so what is
+    // taken decides and what takes it only breaks ties
+    if let Some(captured) = chess_move.captured {
+        score += 10 * piece_value(captured.piece_type()) as i32 - piece_value(moved) as i32;
+    }
+
+    // what the pawn turns into, less the pawn it stops being
+    if let Some(promotion) = chess_move.promotion {
+        score += (piece_value(promotion) - piece_value(PieceType::Pawn)) as i32;
+    }
+
+    // stepping in front of a pawn hands the piece over for a pawn, whatever else the
+    // move does - pawns are left out, since standing up to one another is what they do
+    if moved != PieceType::Pawn
+        && attacked_by_pawn(board, chess_move.to, chess_move.piece.color().opponent())
+    {
+        score -= piece_value(moved) as i32;
+    }
+
+    score
+}
+
+// whether a pawn of `color` covers this square - read off the board as it stands, so
+// the piece that is about to move is still on its old square
+fn attacked_by_pawn(board: &Board, square: u8, color: Color) -> bool {
+    // back down the direction the pawn moves in: the two squares it captures from
+    let rank_step = -color.pawn_direction();
+
+    [(-1, rank_step), (1, rank_step)].iter().any(|&step| {
+        offset(square, step)
+            .and_then(|from| board.piece_at(from))
+            .is_some_and(|piece| piece.is(PieceType::Pawn) && piece.color() == color)
+    })
 }
 
 // what a node with no legal move left is worth to the side to move: it has been
@@ -198,10 +315,7 @@ fn quiescence(
         alpha = stand_pat;
     }
 
-    let mut captures = board.legal_captures();
-    order_captures(&mut captures);
-
-    for chess_move in captures {
+    for chess_move in MoveOrder::captures(board.legal_captures()) {
         // delta pruning: winning this piece for free still would not reach alpha
         if stand_pat + optimistic_gain(&chess_move) + DELTA_MARGIN < alpha {
             continue;
@@ -224,16 +338,13 @@ fn quiescence(
 
 // MVV-LVA: the victim weighs eight times the attacker, so what is taken decides the
 // order and what takes it only breaks ties
-fn order_captures(captures: &mut [Move]) {
-    captures.sort_unstable_by_key(|chess_move| {
-        let victim = chess_move
-            .captured
-            .map_or(0, |piece| piece_value(piece.piece_type()));
-        let attacker = piece_value(chess_move.piece.piece_type());
+fn capture_score(chess_move: &Move) -> i32 {
+    let victim = chess_move
+        .captured
+        .map_or(0, |piece| piece_value(piece.piece_type()));
+    let attacker = piece_value(chess_move.piece.piece_type());
 
-        // negated because sort_unstable_by_key orders ascending
-        -(victim * 8 - attacker)
-    });
+    (victim * 8 - attacker) as i32
 }
 
 // the most a capture could bring in: what it takes, plus what a promotion turns into
@@ -504,6 +615,55 @@ mod tests {
             result.score > 400,
             "a rook against a bare king scored {}",
             result.score
+        );
+    }
+
+    // the three things the ordering is built out of, on one board: the queen capture
+    // comes first, and the rook stepping in front of a pawn comes last
+    #[test]
+    fn the_best_capture_leads_and_a_pawn_covered_square_trails() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 63); // h8
+        board.add_piece(Piece::new(PieceType::Rook, Color::White), 0); // a1
+        board.add_piece(Piece::new(PieceType::Queen, Color::Black), 56); // a8
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 41); // b6
+
+        let moves = board.legal_moves();
+        let ordered: Vec<Move> = MoveOrder::new(&board, moves).collect();
+
+        let first = ordered.first().expect("white has moves");
+        assert_eq!((first.from, first.to), (0, 56), "Rxa8 was not searched first");
+
+        let last = ordered.last().expect("white has moves");
+        assert_eq!((last.from, last.to), (0, 32), "Ra5, where b6 takes it, was not last");
+    }
+
+    // the ordering hands out the moves the search would otherwise have walked itself,
+    // so losing or repeating one loses or repeats a whole subtree
+    #[test]
+    fn the_ordering_hands_out_every_move_once_best_first() {
+        let board = start_position();
+        let moves = board.legal_moves();
+
+        let ordered: Vec<Move> = MoveOrder::new(&board, moves.clone()).collect();
+
+        assert_eq!(ordered.len(), moves.len(), "the move list changed length");
+        for chess_move in &moves {
+            assert_eq!(
+                ordered.iter().filter(|&handed| handed == chess_move).count(),
+                1,
+                "{chess_move:?} was dropped or handed out twice"
+            );
+        }
+
+        let scores: Vec<i32> = ordered
+            .iter()
+            .map(|chess_move| move_score(&board, chess_move))
+            .collect();
+        assert!(
+            scores.windows(2).all(|pair| pair[0] >= pair[1]),
+            "the moves did not come out best first: {scores:?}"
         );
     }
 
