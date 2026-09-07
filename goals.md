@@ -1,10 +1,27 @@
 ## Search
-- indicate how many positions where search thorugh quiescience
+- qscience takes up a HUGE portion of nodes, has to be improved drastically.
+  (1,393,130 / 1,655,546 and 4,212,964 / 5,396,998 - ~78-84% of all nodes)
+
+  - check evasions inside quiescence are completely unpruned and unordered: generates
+    the FULL legal move list (not just captures). perhaps create a seperate "capture only" method, to save time.
+  - loops in raw generation order (no
+    MoveOrder/MVV-LVA), no delta pruning, no depth cap - likely the single biggest cost,
+    since any capture sequence that passes through one check brute-forces its subtree
+
+  - no quiescence depth/ply cap at all - only stops when captures/checks run out
+
+  - possible fixes, roughly in order of impact-to-effort:
+    1. order and prune check evasions the same way normal captures are (MoveOrder at least)
+    2. probe/store the transposition table inside quiescence
+    3. SEE-based pruning instead of MVV-LVA-only ordering
+
 - iterative deepening + adding time needed for it to work
 - move ordering
   - idea: look at pieces positions and their psqt tables. prioritize pieces, that are on a negative psqt table entry.
   - goal: move pieces from bad spots to good spots.
-  - 
+
+
+
 ## Performance
 - save all pieces positions?
 - piece centric board, no downsides in MY current implementation?

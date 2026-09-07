@@ -15,11 +15,9 @@ pub struct Move {
     pub piece: Piece,
     pub captured: Option<Piece>,
     pub castle: Option<CastleSide>,
-    // the piece type the pawn turned into, set only on promotion moves
-    // `piece` stays the pawn, so undo_move can put the pawn back
+    // set only on promotion moves; `piece` stays the pawn so undo_move can restore it
     pub promotion: Option<PieceType>,
-    // true when this is an en passant capture: then `captured` does not stand on `to`
-    // but on the square next to `from`
+    // true when `captured` stands on the square next to `from`, not on `to`
     pub en_passant: bool,
 }
 
@@ -104,10 +102,7 @@ pub fn parse_coordinates(text: &str) -> Option<(u8, u8, Option<PieceType>)> {
     Some((from, to, promotion))
 }
 
-// one entry of the board's history: the move plus the bits of state that cannot be
-// worked out from the position afterwards
-// the position key lives on its own stack instead of in here - the repetition scan
-// reads nothing but keys, and packed they fit three times as many to a cache line
+// one history entry: the move plus state that can't be recovered from the position after
 #[derive(Clone)]
 pub struct MoveRecord {
     pub chess_move: Move,

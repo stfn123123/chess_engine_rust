@@ -26,24 +26,20 @@ const MATE_BOUND: i32 = MATE - 1_000;
 // what a stored score says about the position
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NodeType {
-    // every move was searched and one of them came out inside the window: the score is
-    // what the position is worth
+    // every move was searched inside the window: the score is exact
     Exact,
-    // a move beat beta and the rest were never looked at, so the position is worth at
-    // least this - it could be worth more
+    // a move beat beta; the position is worth at least this
     LowerBound,
-    // no move reached alpha, so the position is worth at most this
+    // no move reached alpha; the position is worth at most this
     UpperBound,
 }
 
 // one stored position
 #[derive(Clone, Copy)]
 struct Entry {
-    // the whole key, not just the bits that picked the slot - the rest is what tells
-    // this position apart from another one filed in the same place
+    // the full key, to tell this position apart from another one in the same slot
     key: u64,
-    // the move that was best here, or the one that caused the cutoff; kept even where
-    // the score cannot be used, since it is still the first move worth trying
+    // the move that was best here, or caused the cutoff; kept even if the score can't be
     best_move: Option<Move>,
     score: i32,
     // how deep the search that produced the score was: a shallower one proves less
@@ -195,10 +191,7 @@ impl TranspositionTable {
     }
 }
 
-// A mate score counts from the node it was found at - "mate in three from here" - and
-// the whole point of the table is that the entry gets read at some other node. So it
-// is stored counted from the position and read back counted from the root, which is
-// the frame the rest of the search works in.
+// mate scores are stored counted from the position, read back counted from the root
 fn to_table(score: i32, ply: u32) -> i32 {
     if score >= MATE_BOUND {
         score + ply as i32

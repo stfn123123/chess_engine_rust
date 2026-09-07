@@ -69,9 +69,8 @@ const fn build_zobrist() -> Zobrist {
     let mut en_passant_file = [0u64; 8];
     let mut state = ZOBRIST_SEED;
 
-    // the three rows no packed byte lands on are filled too - a random key there turns
-    // a stray lookup into a failed hash assert instead of a silent xor by zero
-    // const fn has no for loops, hence the while loops
+    // unused rows are filled too, so a stray lookup fails loud instead of xor-by-zero
+    // (const fn has no for loops, hence while)
     let mut piece = 0;
     while piece < Piece::ZOBRIST_INDEX_COUNT {
         let mut square = 0;

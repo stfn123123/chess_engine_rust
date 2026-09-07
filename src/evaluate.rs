@@ -265,10 +265,7 @@ fn bishop_pair_score(bishops: [usize; 2], phase: i32) -> i32 {
 
     score
 }
-// TODO: evaluate own Pawn structure
-// minus points for doubled pawns, and lone pawns,
-// + points for a passed pawn
-// - points for weak pawns
+// TODO: pawn structure (doubled/isolated/passed/weak)
 fn pawn_structure() -> i32 {
     return 0
 }
@@ -365,9 +362,7 @@ mod tests {
         assert!(score < 0, "black to move scored {score}");
     }
 
-    // once black has answered with the mirror image of the move, the position is
-    // symmetric again and back to equal - which only comes out if the flip at the
-    // end follows the side to move
+    // mirrored moves make the position symmetric again, so it must read as equal
     #[test]
     fn a_symmetric_position_is_equal_again() {
         let mut board = start_position();

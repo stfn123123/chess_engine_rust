@@ -22,8 +22,8 @@ use crate::board::piece::{Color, PieceType};
 use crate::evaluate::{evaluate, game_phase_of};
 use crate::search;
 
-// the panel is a fixed width, the board gets whatever is left over
-const PANEL_WIDTH: f32 = 264.0;
+// the panel is a fixed width, wide enough for its two columns, the board gets the rest
+const PANEL_WIDTH: f32 = 480.0;
 const GAP: f32 = 18.0;
 // below this the board is unusable, so it stops shrinking with the window
 const MIN_BOARD_SIZE: f32 = 240.0;
@@ -36,6 +36,8 @@ struct SearchStats {
     // what the search thinks the position is worth, from white's point of view
     score: i32,
     positions_searched: u64,
+    // of those, how many were quiescence positions rather than full-depth ones
+    positions_searched_quiescience: u64,
     // how many of those the transposition table answered without searching them
     table_cutoffs: u64,
     // how much of the table has been written, 0.0 to 1.0
@@ -151,9 +153,7 @@ impl ChessApp {
         self.tone == Tone::Over
     }
 
-    // everything that is worked out from the position and nothing else, in the one
-    // order that works: the status first, because the evaluation asks it whether the
-    // game is still running
+    // status first, since the evaluation asks it whether the game is still running
     fn position_changed(&mut self) {
         self.refresh_status();
         // the old count belongs to the position that was on the board before this one
@@ -164,9 +164,7 @@ impl ChessApp {
         self.refresh_analysis();
     }
 
-    // what the engine has to say about the position, or nothing at all when it is
-    // turned off - the old numbers are dropped rather than left standing, so nothing
-    // on screen ever belongs to a position other than the one on the board
+    // old numbers are dropped rather than left standing when analysis is off
     fn refresh_analysis(&mut self) {
         if !self.analysis_enabled {
             self.evaluation = None;
@@ -240,9 +238,7 @@ impl ChessApp {
         }
     }
 
-    // the search and the evaluation both score for the side to move, the panel shows
-    // white's point of view - otherwise the sign would flip with every move and the
-    // number would say more about whose turn it is than about the position
+    // scores are for the side to move; the panel always shows white's point of view
     fn white_view(&self, score: i32) -> i32 {
         match self.board.turn() {
             Color::White => score,
@@ -263,6 +259,7 @@ impl ChessApp {
             best_move: result.best_move,
             score: self.white_view(result.score),
             positions_searched: result.positions_searched,
+            positions_searched_quiescience: result.positions_searched_quiescience,
             table_cutoffs: result.table_cutoffs,
             table_fill: result.table_fill,
             from_book: result.from_book,
@@ -371,7 +368,7 @@ impl eframe::App for ChessApp {
 
 pub fn run(settings: Settings) -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([980.0, 780.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 780.0]),
         ..Default::default()
     };
 

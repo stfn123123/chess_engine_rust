@@ -33,14 +33,17 @@
 
 use crate::board::Board;
 use crate::board::chess_move::Move;
-use crate::board::piece::{Color, PieceType};
-use crate::board::square::offset;
-use crate::evaluate::{MATE, evaluate, piece_value};
+use crate::board::piece::{Color, Piece, PieceType};
+use crate::board::square::{
+    DIAGONAL_STEPS, KING_STEPS, KNIGHT_STEPS, STRAIGHT_STEPS, en_passant_captured_square, offset,
+    ray,
+};
+use crate::evaluate::{MATE, evaluate, game_phase_of, piece_value};
 use crate::opening::OpeningBook;
 use crate::transposition::{NodeType, TranspositionTable};
 
 // how deep the search runs unless something asks for another depth
-pub const DEFAULT_DEPTH: u32 = 6;
+pub const DEFAULT_DEPTH: u32 = 8;
 
 const INFINITY: i32 = 1_000_000;
 
@@ -52,14 +55,23 @@ const MAX_MOVES: usize = 256;
 // the piece-square swing of both pieces, which is not known before the move is played
 const DELTA_MARGIN: i32 = 200;
 
+// at or below this phase the margin is dropped: a pawn decides an endgame, and there is
+// little piece-square swing left to cover once the pieces are off
+const DELTA_ENDGAME_PHASE: f32 = 0.25;
+
 // the move the table kept, put ahead of anything the guesswork below can score
 const TABLE_MOVE_SCORE: i32 = 1_000_000;
+
+// what the king is worth to an exchange: it can never be taken, so it has to outweigh
+// anything winning it could bring in
+const SEE_KING_VALUE: i32 = 10_000;
 
 pub struct SearchResult {
     pub depth: u32,
     pub best_move: Option<Move>,
     pub score: i32,
     pub positions_searched: u64,
+    pub positions_searched_quiescience: u64,
     // how many nodes the table answered without searching them
     pub table_cutoffs: u64,
     // how much of the table has been written, 0.0 to 1.0
@@ -68,17 +80,14 @@ pub struct SearchResult {
     pub from_book: bool,
 }
 
-// The engine, as much of it as outlives a single search.
-//
-// That is the opening book, which is the same book all game, and the transposition
-// table: a game is one position after another, and most of what was learned about the
-// last one is still true of this one.
+// the opening book and transposition table, which outlive a single search
 pub struct Search {
     table: TranspositionTable,
     // asked before any searching, and None for a caller that wants the search itself
     book: Option<OpeningBook>,
     // the nodes of the search that is running, counted from its root
     positions_searched: u64,
+    positions_searched_quiescience: u64,
 }
 
 impl Search {
@@ -87,11 +96,11 @@ impl Search {
             table: TranspositionTable::new(table_megabytes),
             book: Some(OpeningBook::new()),
             positions_searched: 0,
+            positions_searched_quiescience: 0,
         }
     }
 
-    // an engine that searches every position, opening or not - what analysing a
-    // position means, as against playing it
+    // searches every position, opening or not - used for analysis, not play
     pub fn without_book(table_megabytes: usize) -> Search {
         Search {
             book: None,
@@ -101,14 +110,14 @@ impl Search {
 
     // the best move for the side to move, searched `depth` plies deep
     pub fn find_best_move(&mut self, board: &mut Board, depth: u32) -> SearchResult {
-        // a position the book holds is answered without searching anything at all,
-        // which is what the book is for
+        // a position the book holds is answered without searching anything at all
         if let Some(opening) = self.book.as_ref().and_then(|book| book.move_for(board)) {
             return SearchResult {
                 depth: 0,
                 best_move: Some(opening),
                 score: 0,
                 positions_searched: 0,
+                positions_searched_quiescience: 0,
                 table_cutoffs: 0,
                 table_fill: self.table.fill(),
                 from_book: true,
@@ -117,6 +126,7 @@ impl Search {
 
         self.table.start_search();
         self.positions_searched = 1;
+        self.positions_searched_quiescience = 0;
 
         let (best_move, score) = self.search_root(board, depth);
 
@@ -125,14 +135,14 @@ impl Search {
             best_move,
             score,
             positions_searched: self.positions_searched,
+            positions_searched_quiescience: self.positions_searched_quiescience,
             table_cutoffs: self.table.cutoffs(),
             table_fill: self.table.fill(),
             from_book: false,
         }
     }
 
-    // the root: like alpha_beta with the window wide open, except that it has to come
-    // out with a move and so can never be answered by the table alone
+    // like alpha_beta with the window wide open, but must return a move
     fn search_root(&mut self, board: &mut Board, depth: u32) -> (Option<Move>, i32) {
         // nothing to search: the game is over, or the caller asked for no depth at all
         let moves = board.legal_moves();
@@ -147,7 +157,6 @@ impl Search {
         let mut best_move = None;
         let mut alpha = -INFINITY;
 
-        // the move that was best here last time, which after a move is played is
         // usually still the answer to what the opponent just did
         let table_move = self.table.best_move(board.hash());
 
@@ -179,21 +188,16 @@ impl Search {
     ) -> i32 {
         self.positions_searched += 1;
 
-        // a repeated position is a draw whatever the pieces say, and it is the moves played
-        // to get here that make it one - so the search is the only place that can see it,
-        // and it holds at every node rather than only at the ones it stops on
+        // a repeated position is a draw regardless of material; only the search sees it
         if board.is_repetition_draw(ply) {
             return 0;
         }
 
-        // asked after the repetition, which the table cannot answer: it files positions,
-        // and whether one of them is a draw is a matter of the moves that led to it
+        // the table files positions, not the moves that led to them, so it's probed after
         let probe = self.table.probe(board.hash(), depth, ply, alpha, beta);
 
-        // this position was searched before, at least as deep, and what came out of it
-        // settles the question this window is asking
         if let Some(score) = probe.cutoff {
-            // a stored bound can lie outside the window, and a node answers within it
+            // a stored bound can lie outside the window, so clamp into it
             return score.clamp(alpha, beta);
         }
 
@@ -207,10 +211,7 @@ impl Search {
             return terminal_score(board, ply);
         }
 
-        // asked only once there is a move to make: a mate delivered on the last ply of the
-        // fifty ends the game as a mate, not as a draw
-        // the table cannot see this coming, since the counter is not part of the key -
-        // right at the fifty it can hand back a score for a position that is a draw here
+        // a mate on the last ply of the fifty still counts as mate, not a draw
         if board.is_fifty_move_draw() {
             return 0;
         }
@@ -226,8 +227,7 @@ impl Search {
             board.undo_move();
 
             if score >= beta {
-                // the rest of the moves were never looked at, so beta is only a floor -
-                // and this move is the one to try first next time
+                // beta is only a floor here, and this is the move to try first next time
                 self.table.store(
                     board.hash(),
                     depth,
@@ -252,12 +252,11 @@ impl Search {
         alpha
     }
 
-    // captures only, until nothing is hanging, then evaluate
-    // the window is the caller's, not a fresh one - that is where most of the pruning is
-    // nothing is filed here: these scores stop at the first quiet position rather than
-    // at a depth, so there is no depth to file them under
+    // captures only, until nothing is hanging, then evaluate; nothing is filed in the
+    // table here, since these scores stop at a quiet position rather than at a depth
     fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: u32) -> i32 {
         self.positions_searched += 1;
+        self.positions_searched_quiescience +=1;
 
         // no standing pat out of a check, and every evasion counts, not only the captures
         if board.is_check(board.turn()) {
@@ -282,8 +281,7 @@ impl Search {
             return alpha;
         }
 
-        // nobody is forced to capture, so this is a floor - asked before generating
-        // anything, because most nodes down here cut off on it
+        // nobody is forced to capture, so this is a floor; most nodes cut off on it
         let stand_pat = evaluate(board);
         if stand_pat >= beta {
             return beta;
@@ -292,9 +290,17 @@ impl Search {
             alpha = stand_pat;
         }
 
+        // the same for every capture here, so it is worked out once
+        let margin = delta_margin(board);
+
         for chess_move in MoveOrder::captures(board.legal_captures()) {
             // delta pruning: winning this piece for free still would not reach alpha
-            if stand_pat + optimistic_gain(&chess_move) + DELTA_MARGIN < alpha {
+            if stand_pat + optimistic_gain(&chess_move) + margin < alpha {
+                continue;
+            }
+
+            // and a capture the recaptures win back is not worth a subtree of its own
+            if see(board, &chess_move) < 0 {
                 continue;
             }
 
@@ -314,29 +320,21 @@ impl Search {
     }
 }
 
-// The moves of one node, handed out best first.
-//
-// Nothing is sorted. Every move is scored once up front, and each `next` walks what
-// is left over for the best of it - a selection sort that stops when the caller
-// stops asking. Most nodes cut off after a move or two, and a sort would have put
-// the whole list in order to get there.
+// the moves of one node, handed out best first: a selection sort that stops when the
+// caller stops asking, since most nodes cut off after a move or two
 struct MoveOrder {
     moves: Vec<Move>,
-    // scored in the same order as `moves`, and swapped along with them
-    // an array rather than a Vec: this is built at every node, and a Vec here would
-    // be an allocation at every node
+    // scored in the same order as `moves`, and swapped along with them; an array rather
+    // than a Vec, since this is built fresh at every node
     scores: [i32; MAX_MOVES],
     handed_out: usize,
 }
 
 impl MoveOrder {
-    // the full move list, scored on everything move_score knows, with the move the
-    // table kept for this position - if it has one - out in front
+    // scored move list, with the table's move for this position - if it has one - in front
     fn new(board: &Board, moves: Vec<Move>, table_move: Option<Move>) -> MoveOrder {
         let mut scores = [0; MAX_MOVES];
         for (index, chess_move) in moves.iter().enumerate() {
-            // matched against the generated list, so two positions sharing a slot can
-            // never hand this node a move that is not legal in it
             scores[index] = if Some(*chess_move) == table_move {
                 TABLE_MOVE_SCORE
             } else {
@@ -395,8 +393,7 @@ fn move_score(board: &Board, chess_move: &Move) -> i32 {
     let mut score = 0;
     let moved = chess_move.piece.piece_type();
 
-    // MVV-LVA: take the most valuable piece with the least valuable one, so what is
-    // taken decides and what takes it only breaks ties
+    // MVV-LVA: what is taken decides, what takes it only breaks ties
     if let Some(captured) = chess_move.captured {
         score += 10 * piece_value(captured.piece_type()) as i32 - piece_value(moved) as i32;
     }
@@ -406,8 +403,7 @@ fn move_score(board: &Board, chess_move: &Move) -> i32 {
         score += (piece_value(promotion) - piece_value(PieceType::Pawn)) as i32;
     }
 
-    // stepping in front of a pawn hands the piece over for a pawn, whatever else the
-    // move does - pawns are left out, since standing up to one another is what they do
+    // stepping in front of a pawn hands the piece over for a pawn; pawns are left out
     if moved != PieceType::Pawn
         && attacked_by_pawn(board, chess_move.to, chess_move.piece.color().opponent())
     {
@@ -417,8 +413,7 @@ fn move_score(board: &Board, chess_move: &Move) -> i32 {
     score
 }
 
-// whether a pawn of `color` covers this square - read off the board as it stands, so
-// the piece that is about to move is still on its old square
+// whether a pawn of `color` covers this square, read off the board as it stands
 fn attacked_by_pawn(board: &Board, square: u8, color: Color) -> bool {
     // back down the direction the pawn moves in: the two squares it captures from
     let rank_step = -color.pawn_direction();
@@ -430,12 +425,8 @@ fn attacked_by_pawn(board: &Board, square: u8, color: Color) -> bool {
     })
 }
 
-// what a node with no legal move left is worth to the side to move: it has been
-// mated, or it is stalemated and the game is a draw
-// the mate is worth a little less the further down the tree it is, so of two winning
-// lines the search takes the shorter one
-// only a caller holding the move list knows this applies, which is why it lives here
-// and not in the evaluation
+// a node with no legal move left: mate, or a draw by stalemate; a mate is worth a
+// little less the deeper it is, so the search takes the shortest winning line
 fn terminal_score(board: &Board, ply: u32) -> i32 {
     if board.is_check(board.turn()) {
         -MATE + ply as i32
@@ -469,6 +460,161 @@ fn optimistic_gain(chess_move: &Move) -> i32 {
     (victim + promotion) as i32
 }
 
+// what delta pruning allows here: nothing once the endgame is reached, where a capture
+// short of alpha today is what a passed pawn is made of tomorrow
+fn delta_margin(board: &Board) -> i32 {
+    if game_phase_of(board) <= DELTA_ENDGAME_PHASE {
+        0
+    } else {
+        DELTA_MARGIN
+    }
+}
+
+// what a capture is worth once both sides have taken on the square with their least
+// valuable attacker in turn - negative means the recaptures win the material back
+fn see(board: &Board, chess_move: &Move) -> i32 {
+    let to = chess_move.to;
+    let color = chess_move.piece.color();
+
+    let mut gone = bit(chess_move.from);
+    // the pawn taken en passant never stood on `to`, and its square opens a rank
+    if chess_move.en_passant {
+        gone |= bit(en_passant_captured_square(to, color));
+    }
+
+    let promotion = chess_move.promotion.map_or(0, |piece_type| {
+        see_value(piece_type) - see_value(PieceType::Pawn)
+    });
+
+    // gains[n] is what the side taking nth is left with if the exchange stops there
+    let mut gains = [0i32; 32];
+    gains[0] = chess_move
+        .captured
+        .map_or(0, |piece| see_value(piece.piece_type()))
+        + promotion;
+
+    // what stands on the square now, waiting to be taken back
+    let mut on_square = match chess_move.promotion {
+        Some(piece_type) => see_value(piece_type),
+        None => see_value(chess_move.piece.piece_type()),
+    };
+    let mut side = color.opponent();
+    let mut depth = 0;
+
+    while let Some((square, value)) = least_valuable_attacker(board, to, side, gone) {
+        if depth + 1 == gains.len() {
+            break;
+        }
+
+        // the king may only take where nothing is left to take it back
+        let after = gone | bit(square);
+        if value == SEE_KING_VALUE
+            && least_valuable_attacker(board, to, side.opponent(), after).is_some()
+        {
+            break;
+        }
+
+        depth += 1;
+        gains[depth] = on_square - gains[depth - 1];
+        gone = after;
+        on_square = value;
+        side = side.opponent();
+    }
+
+    // back down the list: nobody has to take, so each side stops where taking is worse
+    while depth > 0 {
+        gains[depth - 1] = -i32::max(-gains[depth - 1], gains[depth]);
+        depth -= 1;
+    }
+
+    gains[0]
+}
+
+// the cheapest piece of `color` that can take on `square`, with what the exchange has
+// already taken off treated as gone
+fn least_valuable_attacker(
+    board: &Board,
+    square: u8,
+    color: Color,
+    gone: u64,
+) -> Option<(u8, i32)> {
+    let mut best = None;
+
+    // a pawn attacks from one rank back along its own direction of travel
+    let pawn_step = -color.pawn_direction();
+    for file_step in [-1, 1] {
+        if let Some(from) = offset(square, (file_step, pawn_step))
+            && standing(board, from, gone)
+                .is_some_and(|piece| piece.is(PieceType::Pawn) && piece.color() == color)
+        {
+            // nothing takes more cheaply than a pawn
+            return Some((from, see_value(PieceType::Pawn)));
+        }
+    }
+
+    for (steps, piece_type) in [
+        (&KNIGHT_STEPS, PieceType::Knight),
+        (&KING_STEPS, PieceType::King),
+    ] {
+        for &step in steps {
+            if let Some(from) = offset(square, step)
+                && standing(board, from, gone)
+                    .is_some_and(|piece| piece.is(piece_type) && piece.color() == color)
+            {
+                cheaper(&mut best, from, see_value(piece_type));
+            }
+        }
+    }
+
+    // the first piece a line runs into is the only one that can attack along it
+    for (steps, slider) in [
+        (&DIAGONAL_STEPS, PieceType::Bishop),
+        (&STRAIGHT_STEPS, PieceType::Rook),
+    ] {
+        for &step in steps {
+            for from in ray(square, step) {
+                let Some(piece) = standing(board, from, gone) else {
+                    continue;
+                };
+                if piece.color() == color && (piece.is(slider) || piece.is(PieceType::Queen)) {
+                    cheaper(&mut best, from, see_value(piece.piece_type()));
+                }
+                break;
+            }
+        }
+    }
+
+    best
+}
+
+fn cheaper(best: &mut Option<(u8, i32)>, square: u8, value: i32) {
+    if best.is_none_or(|(_, current)| value < current) {
+        *best = Some((square, value));
+    }
+}
+
+// the piece on a square, once what the exchange has taken off is gone
+fn standing(board: &Board, square: u8, gone: u64) -> Option<Piece> {
+    if gone & bit(square) == 0 {
+        board.piece_at(square)
+    } else {
+        None
+    }
+}
+
+// piece values as an exchange counts them, the king included
+fn see_value(piece_type: PieceType) -> i32 {
+    match piece_type {
+        PieceType::King => SEE_KING_VALUE,
+        other => piece_value(other) as i32,
+    }
+}
+
+// a square as a single bit, so a set of squares fits into one number
+fn bit(square: u8) -> u64 {
+    1 << square
+}
+
 // how many positions are `depth` plies away - the check that move generation is
 // right, not part of playing a game
 pub fn count_positions(board: &mut Board, depth: u32) -> u64 {
@@ -497,16 +643,12 @@ mod tests {
         board
     }
 
-    // a table small enough that a test can have one of its own, and small enough that
-    // positions land on the same slot - which is what the key check is there for
-    // no book: what these tests are about is the searching, and the book would answer
-    // the opening positions among them before any of it ran
+    // a small table of its own, and no book, since these tests are about the searching
     fn search() -> Search {
         Search::without_book(1)
     }
 
-    // one search on a table nothing else has touched: what a test means when it does
-    // not care what the table keeps from one search to the next
+    // one search on a table nothing else has touched
     fn find_best_move(board: &mut Board, depth: u32) -> SearchResult {
         search().find_best_move(board, depth)
     }
@@ -534,11 +676,9 @@ mod tests {
         assert_eq!(board.hash(), hash_before);
     }
 
-    // plain negamax, no window, no cutoffs and no table: the answer alpha-beta has to
-    // match. the Search it is handed is only there to run quiescence out of
+    // plain negamax, no window, no cutoffs and no table: the answer alpha_beta must match
     fn negamax(search: &mut Search, board: &mut Board, depth: u32, ply: u32) -> i32 {
-        // the draw rules have to be read exactly as alpha_beta reads them, or the two
-        // disagree about scores that have nothing to do with pruning
+        // draw rules read exactly as alpha_beta reads them, or scores disagree for free
         if ply > 0 && board.is_repetition_draw(ply) {
             return 0;
         }
@@ -602,8 +742,7 @@ mod tests {
         board
     }
 
-    // at one ply the search moves and stops, so Qxd5 reads as a free pawn - only
-    // quiescence finds exd5
+    // at one ply Qxd5 reads as a free pawn; only quiescence finds exd5
     #[test]
     fn a_defended_pawn_is_not_taken_by_the_queen() {
         let mut board = Board::new();
@@ -658,8 +797,7 @@ mod tests {
         }
     }
 
-    // the whole point of the pruning: it only skips moves that cannot change the
-    // outcome, so the score has to come out the same as a full search
+    // pruning only skips moves that can't change the outcome, so the score must match
     #[test]
     fn pruning_does_not_change_the_score() {
         let mut board = start_position();
@@ -699,9 +837,7 @@ mod tests {
         assert_eq!(find_best_move(&mut stalemated, 3).score, 0);
     }
 
-    // the mate is delivered by the deepest move the search makes, so the position it
-    // leads to is a leaf - which is exactly where a search that only looks for mate
-    // where it has a move list anyway would miss it
+    // the mate is delivered by the deepest move, so the position it leads to is a leaf
     #[test]
     fn a_mate_on_the_horizon_is_found() {
         let mut board = Board::new();
@@ -730,9 +866,7 @@ mod tests {
 
         assert_eq!((best.from, best.to), (0, 8), "white played something else");
 
-        // taking the queen leaves white a rook against a bare king, so the score is
-        // the rook - not the queen, which is off the board rather than white's - less
-        // whatever the tables say about where the two kings and the rook end up
+        // taking the queen leaves white a rook against a bare king
         assert!(
             result.score > 400,
             "a rook against a bare king scored {}",
@@ -740,8 +874,7 @@ mod tests {
         );
     }
 
-    // the three things the ordering is built out of, on one board: the queen capture
-    // comes first, and the rook stepping in front of a pawn comes last
+    // the queen capture comes first, the rook stepping in front of a pawn comes last
     #[test]
     fn the_best_capture_leads_and_a_pawn_covered_square_trails() {
         let mut board = Board::new();
@@ -761,8 +894,7 @@ mod tests {
         assert_eq!((last.from, last.to), (0, 32), "Ra5, where b6 takes it, was not last");
     }
 
-    // the ordering hands out the moves the search would otherwise have walked itself,
-    // so losing or repeating one loses or repeats a whole subtree
+    // losing or repeating a move here loses or repeats a whole subtree in the search
     #[test]
     fn the_ordering_hands_out_every_move_once_best_first() {
         let board = start_position();
@@ -789,11 +921,111 @@ mod tests {
         );
     }
 
+    // the generated capture between two squares, which is what see is asked about
+    fn capture_of(board: &Board, from: u8, to: u8) -> Move {
+        board
+            .legal_captures()
+            .into_iter()
+            .find(|candidate| candidate.from == from && candidate.to == to)
+            .expect("that capture is legal here")
+    }
+
+    // the margin covers a piece-square swing that is not there any more once the pieces
+    // are off, and in an endgame the pawn it prunes away is the game
+    #[test]
+    fn the_delta_margin_goes_out_in_the_endgame() {
+        assert_eq!(delta_margin(&start_position()), DELTA_MARGIN);
+
+        let mut endgame = Board::new();
+        endgame.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        endgame.add_piece(Piece::new(PieceType::King, Color::Black), 60); // e8
+        endgame.add_piece(Piece::new(PieceType::Rook, Color::White), 0); // a1
+
+        assert_eq!(delta_margin(&endgame), 0);
+
+        // a queen and a rook are a phase of exactly 0.25, which the line lets through
+        let mut boundary = Board::new();
+        boundary.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        boundary.add_piece(Piece::new(PieceType::King, Color::Black), 60); // e8
+        boundary.add_piece(Piece::new(PieceType::Queen, Color::White), 3); // d1
+        boundary.add_piece(Piece::new(PieceType::Rook, Color::Black), 56); // a8
+
+        assert_eq!(game_phase_of(&boundary), DELTA_ENDGAME_PHASE);
+        assert_eq!(delta_margin(&boundary), 0);
+    }
+
+    // a piece standing for nothing is worth what it is worth
+    #[test]
+    fn see_wins_an_undefended_piece() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 63); // h8
+        board.add_piece(Piece::new(PieceType::Rook, Color::White), 0); // a1
+        board.add_piece(Piece::new(PieceType::Queen, Color::Black), 8); // a2
+
+        let capture = capture_of(&board, 0, 8);
+
+        assert_eq!(see(&board, &capture), piece_value(PieceType::Queen) as i32);
+    }
+
+    // Qxd5 wins a pawn and loses the queen to exd5, which is what gets pruned
+    #[test]
+    fn see_refuses_a_capture_the_recapture_wins_back() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        board.add_piece(Piece::new(PieceType::Queen, Color::White), 3); // d1
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 63); // h8
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 35); // d5
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 44); // e6
+
+        let capture = capture_of(&board, 3, 35);
+
+        assert_eq!(
+            see(&board, &capture),
+            (piece_value(PieceType::Pawn) - piece_value(PieceType::Queen)) as i32
+        );
+    }
+
+    // pawn for pawn comes out at nothing, and nothing is not below the pruning line
+    #[test]
+    fn see_counts_an_even_trade_as_nothing() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 63); // h8
+        board.add_piece(Piece::new(PieceType::Pawn, Color::White), 28); // e4
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 35); // d5
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 42); // c6
+
+        let capture = capture_of(&board, 28, 35);
+
+        assert_eq!(see(&board, &capture), 0);
+    }
+
+    // the rook on d1 only joins in once the one on d2 has left the file
+    #[test]
+    fn see_counts_the_slider_a_capture_uncovers() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 63); // h8
+        board.add_piece(Piece::new(PieceType::Rook, Color::White), 3); // d1
+        board.add_piece(Piece::new(PieceType::Rook, Color::White), 11); // d2
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 35); // d5
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 44); // e6
+        board.add_piece(Piece::new(PieceType::Rook, Color::Black), 59); // d8
+
+        let capture = capture_of(&board, 11, 35);
+
+        // Rxd5 exd5 and white stops: taking back with d1 only loses that rook to Rxd5 too
+        assert_eq!(
+            see(&board, &capture),
+            (piece_value(PieceType::Pawn) - piece_value(PieceType::Rook)) as i32
+        );
+    }
+
     // mate in one, found and scored as a mate rather than as material
     #[test]
     fn mate_in_one_is_found() {
-        // the two rook mate: Rb1-b8 checks along the eighth rank while the rook on
-        // a7 takes the seventh away from the king
+        // the two rook mate: Rb1-b8 checks while the rook on a7 covers the seventh
         let mut board = Board::new();
         board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
         board.add_piece(Piece::new(PieceType::King, Color::Black), 63); // h8
@@ -824,8 +1056,7 @@ mod tests {
         board
     }
 
-    // the table is there to save work, not to change answers: the same position
-    // searched again on a table that already holds it comes out the same way
+    // the table saves work, not changes answers: a re-searched position comes out the same
     #[test]
     fn a_second_search_of_a_position_answers_as_the_first_did() {
         for mut board in [start_position(), mate_in_one()] {
@@ -860,8 +1091,7 @@ mod tests {
         assert!(second.table_cutoffs > 0, "the table answered nothing");
     }
 
-    // a mate is stored counted from the position it was found at, so reading it back
-    // somewhere else has to count it from the root again
+    // a mate is stored counted from where it was found, read back counted from the root
     #[test]
     fn a_mate_keeps_its_distance_across_searches() {
         let mut board = mate_in_one();
@@ -879,8 +1109,7 @@ mod tests {
         let board = start_position();
         let moves = board.legal_moves();
 
-        // Nb1c3: a quiet move, which the ordering has no reason to put ahead of the
-        // pawn moves that come before it in the list
+        // Nb1c3: a quiet move the ordering has no reason to put ahead of the pawn moves
         let table_move = *moves
             .iter()
             .find(|chess_move| (chess_move.from, chess_move.to) == (1, 18))
@@ -902,8 +1131,7 @@ mod tests {
         assert!(result.from_book, "the start position was searched, not looked up");
         assert_eq!(result.positions_searched, 0, "a book move cost a search anyway");
 
-        // which of the openings it draws is the book's business, and it draws a new
-        // one every game - what matters here is that it is a move that can be played
+        // which opening it draws is the book's business; it just has to be playable
         let opening = result.best_move.expect("the book has an opening");
         assert!(
             board.legal_moves().contains(&opening),

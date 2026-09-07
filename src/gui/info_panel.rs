@@ -1,8 +1,9 @@
 // The right-hand panel: whose move it is, how the game stands, and what the last
 // search at the current position cost.
 //
-// Everything in here is one column, top to bottom, and the whole column scrolls -
-// so a narrow or short window hides nothing, it only asks to be scrolled.
+// The header and the score/search stats sit in a left column; the testing controls
+// (toggles, perft, saved positions) sit in a right column beside them. The whole
+// panel scrolls as one block, so a short window hides nothing, it only asks to scroll.
 
 use eframe::egui;
 use std::time::Duration;
@@ -25,10 +26,7 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
         egui::StrokeKind::Inside,
     );
 
-    // everything below is laid out inside the panel, not next to it
-    // the layout has to be spelled out: a UiBuilder without one inherits the parent's,
-    // and the parent is the horizontal row that puts this panel beside the board -
-    // which would lay every label out side by side instead of stacking them
+    // layout must be spelled out, or it inherits the parent's horizontal row
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect.shrink(18.0))
@@ -52,20 +50,20 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
                 divider(ui);
                 ui.add_space(16.0);
 
-                turn_block(app, ui);
-                status_block(app, ui);
-                evaluation_block(app, ui);
-                phase_block(app, ui);
+                ui.columns(2, |columns| {
+                    let left = &mut columns[0];
+                    turn_block(app, left);
+                    status_block(app, left);
+                    evaluation_block(app, left);
+                    phase_block(app, left);
 
-                divider(ui);
-                ui.add_space(16.0);
+                    divider(left);
+                    left.add_space(16.0);
 
-                search_blocks(app, ui);
+                    search_blocks(app, left);
 
-                divider(ui);
-                ui.add_space(16.0);
-
-                testing_blocks(app, ui);
+                    testing_blocks(app, &mut columns[1]);
+                });
 
                 ui.add_space(4.0);
                 if new_game_button(ui) {
@@ -198,6 +196,12 @@ fn search_blocks(app: &ChessApp, ui: &mut egui::Ui) {
     );
     stat_block(
         ui,
+        "QUIESCENCE POSITIONS",
+        &format_count(stats.positions_searched_quiescience),
+        TEXT_PRIMARY,
+    );
+    stat_block(
+        ui,
         "TIME TAKEN",
         &format_duration(stats.duration),
         STAT_TIME,
@@ -272,9 +276,7 @@ fn testing_blocks(app: &mut ChessApp, ui: &mut egui::Ui) {
     saved_positions_block(app, ui);
 }
 
-// counting every position a given number of plies away, for checking move generation
-// against the published perft numbers - the depth sits next to the button, because it
-// is the one thing about this run that is worth changing between clicks
+// perft: counts positions at a given depth, checked against published numbers
 fn perft_block(app: &mut ChessApp, ui: &mut egui::Ui, full_width: f32) {
     let mut run = false;
 

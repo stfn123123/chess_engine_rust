@@ -39,9 +39,7 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, board_size: f32) {
                 piece_image(piece).paint_at(ui, cell_rect.shrink(cell * 0.08));
             }
 
-            // legal-move markers are drawn on top of the piece: a capture gets a ring
-            // around the square (a centered dot would be hidden behind the piece),
-            // an empty destination gets a small centered dot
+            // capture: a ring around the square; empty destination: a centered dot
             if app.legal_targets.contains(&square) {
                 if occupant.is_some() {
                     ui.painter().circle_stroke(

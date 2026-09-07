@@ -38,8 +38,7 @@ impl Board {
     }
 
     fn generate(&self, color: Color, captures_only: bool) -> Vec<Move> {
-        // a position without a king only comes from a hand built board; there is no
-        // king to keep safe, so every pseudo-legal move is as legal as it gets
+        // a hand built board without a king has no king to keep safe
         let Some(king_square) = self.king_square(color) else {
             let mut moves = self.pseudo_legal_moves(color);
             if captures_only {
@@ -68,9 +67,7 @@ impl Board {
             None => u64::MAX,
         };
 
-        // the moves of the piece being looked at, before the mask above has had its
-        // say - one buffer for the whole walk, emptied and refilled per piece, so no
-        // piece allocates one of its own
+        // one buffer for the whole walk, emptied and refilled per piece
         let mut candidates = Vec::with_capacity(32);
 
         // walking the squares once and dispatching on what stands there beats asking
@@ -138,10 +135,7 @@ impl Board {
         moves
     }
 
-    // the pseudo-legal moves of a single piece, castling aside
-    // every generator below appends to the list it is handed instead of returning one
-    // of its own: the search asks for the moves of a position hundreds of thousands of
-    // times, and a Vec per piece is an allocation per piece
+    // pseudo-legal moves of a single piece, castling aside; appends rather than allocates
     fn moves_for_piece(&self, moves: &mut Vec<Move>, piece: Piece, from: u8) {
         match piece.piece_type() {
             PieceType::Bishop => self.sliding_moves(moves, piece, from, &DIAGONAL_STEPS),
@@ -175,11 +169,8 @@ impl Board {
         }
     }
 
-    // every piece of `color` that lines up with the opposing king, with whatever stands
-    // in between ignored: "who would give check if the board were empty in between".
-    // color = White means every white piece pointing at the black king.
-    // Whether such a piece really checks the king or only pins a piece to it is decided
-    // in evaluate_pins, which counts what stands in the way
+    // pieces of `color` lining up with the opposing king, ignoring what stands between -
+    // whether each really checks or only pins is sorted out later, in evaluate_pins
     fn possible_king_attackers(&self, color: Color) -> AttackerList {
         let mut attackers = AttackerList::new();
         let Some(king_square) = self.king_square(color.opponent()) else {
@@ -209,10 +200,8 @@ impl Board {
             }
         }
 
-        // along each line the pieces of the king's own side are stepped over, since
-        // those are exactly the pieces that might turn out to be pinned. The first
-        // piece of the attacking color ends the walk either way: anything behind it is
-        // blocked by a piece that can never be pinned to this king
+        // steps over the king's own pieces, which might be pinned; the first enemy piece
+        // on the line ends the walk either way
         for (steps, slider) in [
             (&DIAGONAL_STEPS, PieceType::Bishop),
             (&STRAIGHT_STEPS, PieceType::Rook),
@@ -236,12 +225,7 @@ impl Board {
         attackers
     }
 
-    // sorts the possible attackers by how many pieces stand between them and the king:
-    // - no piece:    the attack goes through, the king is in check
-    // - one piece:   that piece is pinned to the king
-    // - two or more: the line is blocked for good, the attacker does nothing
-    // Both answers fall out of the same walk, so both are returned: the pieces that
-    // really check the king, and the pinned ones with the line each is pinned on
+    // sorts attackers by pieces in between: none = check, one = pinned, two+ = blocked
     fn evaluate_pins(&self, color: Color) -> KingSafety {
         let mut safety = KingSafety::new();
         let Some(king_square) = self.king_square(color.opponent()) else {
@@ -277,9 +261,7 @@ impl Board {
                 continue;
             }
 
-            // the line from the king up to and including the attacker: where a check
-            // can be blocked or the checking piece taken, and the only stretch a pinned
-            // piece may move along without opening the line
+            // king up to and including the attacker: where check is blocked or the pin held
             let line = bit(attacker.square) | ray_between(king_square, attacker.square);
 
             match blocker {
@@ -308,11 +290,8 @@ impl Board {
         }
     }
 
-    // the king steps onto every square around it that no enemy piece covers
-    // no mask can be worked out for the king beforehand: it is the piece the whole scan
-    // is about, and every step changes what the enemy reaches. The scan runs with the
-    // king lifted off the board, otherwise it would block the very ray it is trying to
-    // step out of and stepping straight backwards would look safe
+    // king steps onto squares no enemy piece covers; scanned with the king lifted off
+    // the board, or it would block the very ray it is stepping out of
     fn king_moves(&self, moves: &mut Vec<Move>, king: Piece, from: u8, captures_only: bool) {
         let enemy = king.color().opponent();
         let overlay = Overlay::vacating(from);
@@ -338,10 +317,7 @@ impl Board {
         }
     }
 
-    // an en passant capture takes a pawn off a square it does not end on, and two pawns
-    // leave the same rank at once - a rook waiting on that rank can be uncovered that
-    // way, which no pin scan ever saw. So the position the capture leads to is scanned
-    // directly; en passant is rare enough for that to cost nothing
+    // two pawns leave the same rank at once, which no pin scan sees - scanned directly
     fn en_passant_is_legal(&self, candidate: &Move, king_square: u8) -> bool {
         let color = candidate.piece.color();
         let overlay = Overlay {
@@ -440,10 +416,8 @@ impl Board {
         }
     }
 
-    // is the given square attacked by any piece of the given color
-    // this looks outward from the square ("what could reach me from here") instead of
-    // generating every move of that side, so it allocates nothing and stops at the
-    // first attacker it finds
+    // is the given square attacked - looks outward from the square rather than
+    // generating every move of that side, so it allocates nothing
     pub(crate) fn is_attacked(&self, square: u8, color: Color) -> bool {
         self.is_attacked_over(square, color, Overlay::NONE)
     }
@@ -537,9 +511,8 @@ impl Board {
     }
 }
 
-// the board as a move would leave it: the squares in `vacated` are treated as empty and
-// `filled` as holding a piece. Only the attack scan uses it, and only for the two moves
-// no mask can judge - a king step and an en passant capture
+// the board as a move would leave it, for the two moves no mask can judge: a king
+// step and an en passant capture
 #[derive(Clone, Copy)]
 struct Overlay {
     vacated: u64,
@@ -805,9 +778,7 @@ mod tests {
         assert_eq!(moves.len(), 4);
     }
 
-    // white king a5, white pawn b5, black pawn arriving on c5, and with `with_rook` a
-    // black rook on h5: capturing en passant takes both pawns off the fifth rank at
-    // once, which is the one line no pin scan can see coming
+    // with `with_rook`, a rook on h5 waits on the rank both pawns leave at once
     fn en_passant_position(with_rook: bool) -> Board {
         let mut pieces = vec![
             (PieceType::King, Color::White, 32),

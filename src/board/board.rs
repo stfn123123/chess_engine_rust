@@ -166,9 +166,7 @@ impl Board {
 
 // -------------------- playing moves --------------------
 impl Board {
-    // plays a move and pushes it onto the history, so undo_move can take it back
-    // the move is taken as given: whatever it says about castling, promotion and en
-    // passant is what happens, which is what the generator in `movegen` filled in
+    // plays a move as given and pushes it onto the history so undo_move can take it back
     pub fn make_move(&mut self, chess_move: &Move) {
         let record = MoveRecord {
             chess_move: *chess_move,
@@ -231,8 +229,6 @@ impl Board {
         };
         self.flip_turn();
 
-        // last, because whether the target is capturable depends on the finished
-        // position and on the side that is to move now
         // only a double push opens a target, every other move closes it
         let target = if piece.is(PieceType::Pawn) && (to as i8 - from as i8).abs() == 16 {
             Some((from + to) / 2)
@@ -267,10 +263,7 @@ impl Board {
         self.make_move(&chess_move);
     }
 
-    // undoes the last move (pop from the history, restore the captured piece and the
-    // castling rights, move a castled rook back, flip turn back)
-    // a promotion needs no extra work: `piece` is still the pawn, so putting it back
-    // on `from` removes the promoted piece from the board
+    // undoes the last move; a promotion needs no extra work since `piece` is still the pawn
     pub fn undo_move(&mut self) -> Option<Move> {
         let record = self.history.pop()?;
         self.position_keys.pop();
@@ -324,10 +317,7 @@ impl Board {
         Some(chess_move)
     }
 
-    // works out what kind of move going from `from` to `to` is:
-    // a king moving two files is taken as a castle, a pawn reaching the last rank is
-    // taken as a promotion (defaulting to a queen), and a pawn moving diagonally onto
-    // an empty square is taken as an en passant capture
+    // infers castle/promotion(queen default)/en passant from the two squares moved between
     fn describe_move(&self, from: u8, to: u8, promotion: Option<PieceType>) -> Move {
         let piece = self.piece_at(from).expect("no piece on the from square");
         let color = piece.color();
@@ -362,8 +352,6 @@ impl Board {
 // -------------------- how the game ends --------------------
 impl Board {
     // every move the side to move may play
-    // the generator in `movegen` works these out from the position alone, so nothing
-    // has to be played and taken back again here
     pub fn legal_moves(&self) -> Vec<Move> {
         self.legal_moves_for(self.turn)
     }
@@ -400,19 +388,14 @@ impl Board {
         }
     }
 
-    // the keys of the positions the current one could still repeat: back to the last
-    // capture or pawn move, which no earlier position can survive
-    // the halfmove clock is that distance already, so nothing has to be walked for it
+    // keys back to the last capture or pawn move, which the halfmove clock already counts
     fn reversible_keys(&self) -> &[u64] {
         let window = (self.halfmove_clock as usize).min(self.position_keys.len());
         &self.position_keys[self.position_keys.len() - window..]
     }
 
-    // the positions worth comparing against, paired with how many plies back they are
-    // only every second one can match: a position repeats with the same side to move,
-    // and the side to move is part of the key
-    // it starts four plies back because that is the shortest way back to a position -
-    // both sides have to move a piece and move it back again
+    // positions paired with plies back; only every second one can match same side to move,
+    // and it starts four back since both sides must move a piece and move it back again
     fn repetition_candidates(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
         self.reversible_keys()
             .iter()
@@ -445,16 +428,8 @@ impl Board {
         self.position_repetitions() >= 3
     }
 
-    // a draw by repetition as the search should see it, `ply` plies below its root.
-    //
-    // one repetition inside the tree is already enough: the line got back to a position
-    // it had already reached, so either side can simply do it again, and waiting for a
-    // third costs four plies of depth on exactly the perpetuals that decide games.
-    // before the root the real rule applies, because that is the game being played.
-    //
-    // note that this is path dependent - the same position is a draw or not depending
-    // on how it was reached - so a score that came out of here must never be stored in
-    // a transposition table under the position key alone
+    // one repetition inside the tree is enough; before the root the real threefold rule
+    // applies. path dependent, so never store this score under the position key alone
     pub fn is_repetition_draw(&self, ply: u32) -> bool {
         if self.halfmove_clock < 4 {
             return false;
@@ -517,11 +492,8 @@ impl Board {
     }
 }
 
-// with no pawns, rooks or queens left, whether anyone can still mate comes down to
-// the minor pieces alone: one minor each at most cannot do it, and neither can two
-// knights against a bare king
-// both counts are [white, black]; kept out of `Board` so that a caller which has
-// counted the pieces for its own reasons can ask without counting them again
+// with no pawns, rooks or queens left, mating needs more than one minor each (or two
+// knights against a bare king); counts are [white, black]
 pub fn insufficient_minors(bishops: [usize; 2], knights: [usize; 2]) -> bool {
     let white_minors = bishops[0] + knights[0];
     let black_minors = bishops[1] + knights[1];
@@ -575,10 +547,8 @@ impl Board {
         self.castling_rights = castling_rights;
     }
 
-    // only the file of the target is hashed, and only while the side to move can really
-    // capture onto it - two positions that differ in an unusable target are the same
-    // position, so they have to get the same hash
-    // call this only once the position and the side to move are final
+    // only the file is hashed, and only while the side to move can really capture onto it;
+    // call this only once the position and side to move are final
     fn set_en_passant_target(&mut self, target: Option<u8>) {
         self.en_passant_target = target;
 
@@ -629,9 +599,7 @@ impl Board {
             .sum()
     }
 
-    // the hash of the current position computed from scratch
-    // the incrementally updated hash has to match this at all times, which is what the
-    // debug_assert in make_move/undo_move checks
+    // the hash recomputed from scratch, checked against the incremental one in debug_asserts
     fn full_hash(&self) -> u64 {
         let mut hash = ZOBRIST.castling(self.castling_rights);
 
@@ -763,9 +731,7 @@ mod tests {
         assert!(board.is_threefold_repetition());
     }
 
-    // a pawn move shuts the window, so the shuffle after it repeats only the position
-    // the pawns left behind - the two visits to the start position are out of reach and
-    // the scan must not count them or run back that far looking
+    // a pawn move shuts the window, so the scan must not reach back past it
     #[test]
     fn a_pawn_move_closes_the_repetition_window() {
         let mut board = start_position();

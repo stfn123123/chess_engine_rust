@@ -64,9 +64,7 @@ pub fn ray(from: u8, step: (i8, i8)) -> impl Iterator<Item = u8> {
     })
 }
 
-// the single step that leads from one square towards another, when the two share a
-// rank, a file or a diagonal - None when they do not line up at all (a knight's jump)
-// or when they are the same square
+// the step from one square to another along a shared rank/file/diagonal, else None
 pub fn direction_between(from: u8, to: u8) -> Option<(i8, i8)> {
     let file_step = file_of(to) as i8 - file_of(from) as i8;
     let rank_step = rank_of(to) as i8 - rank_of(from) as i8;

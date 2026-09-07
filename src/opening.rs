@@ -44,12 +44,7 @@ use crate::board::square::{file_of, offset};
 use std::ops::Range;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// The three books, asked in this order: the first that has the position answers it,
-// and the next is only asked because the one before it had nothing. A book covers the
-// lines whoever built it cared about, so where one stops another often carries on.
-//
-// All three are carried in the binary, which is what include_bytes! does - swapping a
-// book is a matter of the file named here and nothing else.
+// asked in order; each is carried into the binary via include_bytes!
 const BOOK_1: &[u8] = include_bytes!("../assets/opening_books/gm2001.bin");
 const BOOK_2: &[u8] = include_bytes!("../assets/opening_books/rodent.bin");
 const BOOK_3: &[u8] = include_bytes!("../assets/opening_books/komodo.bin");
@@ -144,11 +139,7 @@ impl OpeningBook {
         OpeningBook { books, seed }
     }
 
-    // what the books play here, or None once the game has left all of them.
-    //
-    // They are asked in turn, and a book that does not hold the position is exactly
-    // what the one after it is for. So is a book that holds it but writes down nothing
-    // playable - a key two positions share, or a book meant for another game.
+    // what the books play here, or None once the game has left all of them
     pub fn move_for(&self, board: &Board) -> Option<Move> {
         let key = polyglot_key(board);
 
@@ -176,8 +167,7 @@ impl OpeningBook {
     }
 }
 
-// One book's answer to a position: the moves it writes down that can actually be
-// played here, with one of them drawn against the weight behind each.
+// one book's playable moves here, with one drawn against the weight behind each
 fn draw_from(
     book: Book,
     entries: Range<usize>,
@@ -233,11 +223,7 @@ fn seed_from_the_clock() -> u64 {
         .map_or(0, |since| since.as_nanos() as u64)
 }
 
-// A book move is six bits of `to`, six of `from` and three for what a pawn promotes
-// into, with the squares numbered as they are here: rank times eight plus file.
-//
-// The move is looked for among the legal moves rather than played as it stands, so
-// a book keyed to some other game can hand this position nothing.
+// six bits `to`, six bits `from`, three bits promotion; matched against the legal moves
 fn decode(board: &Board, moves: &[Move], encoded: u16) -> Option<Move> {
     let to = (encoded & 0b11_1111) as u8;
     let from = ((encoded >> 6) & 0b11_1111) as u8;
@@ -571,16 +557,13 @@ mod tests {
         OpeningBook::seeded(seed)
     }
 
-    // the key of the starting position is published with the format, and the others
-    // here are keys somebody else worked out for the same positions - so this is the
-    // scheme checked against a second opinion rather than against itself
+    // keys checked against a published second opinion, not just against themselves
     #[test]
     fn the_starting_position_hashes_to_the_published_key() {
         assert_eq!(polyglot_key(&start_position()), 0x463b_9618_1691_fc9c);
     }
 
-    // a double push nobody stands next to is no en passant as far as the key goes, and
-    // a book that counted it would lose every position after 1. e4
+    // a double push nobody stands next to is not en passant as far as the key goes
     #[test]
     fn an_en_passant_nobody_can_take_is_left_out_of_the_key() {
         let mut board = start_position();

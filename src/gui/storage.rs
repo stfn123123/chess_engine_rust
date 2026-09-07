@@ -66,9 +66,7 @@ fn read_line(line: &str) -> Option<SavedPosition> {
     for text in moves.split_whitespace() {
         let (from, to, promotion) = parse_coordinates(text)?;
 
-        // an edited or outdated file could name a move that is not legal here, and
-        // playing one of those would bring the program down rather than only lose the
-        // line it stands on
+        // an edited or outdated file could name a move that isn't legal here
         let legal = board.legal_moves().into_iter().any(|candidate| {
             candidate.from == from && candidate.to == to && candidate.promotion == promotion
         });
