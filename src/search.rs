@@ -43,7 +43,7 @@ use crate::opening::OpeningBook;
 use crate::transposition::{NodeType, TranspositionTable};
 
 // how deep the search runs unless something asks for another depth
-pub const DEFAULT_DEPTH: u32 = 8;
+pub const DEFAULT_DEPTH: u32 = 6;
 
 const INFINITY: i32 = 1_000_000;
 
@@ -155,6 +155,9 @@ impl Search {
         }
 
         let mut best_move = None;
+        // whether best_move repeats a position already on the board this game -
+        // tracked only to break ties, never to prefer a move that scores worse
+        let mut best_repeats = false;
         let mut alpha = -INFINITY;
 
         // usually still the answer to what the opponent just did
@@ -163,11 +166,18 @@ impl Search {
         for chess_move in MoveOrder::new(board, moves, table_move) {
             board.make_move(&chess_move);
             let score = -self.alpha_beta(board, depth - 1, -INFINITY, -alpha, 1);
+            let repeats = board.position_repetitions() > 1;
             board.undo_move();
 
-            if best_move.is_none() || score > alpha {
+            // among moves the search scores the same, the one that does not repeat
+            // a position already reached this game is the one worth playing
+            let better =
+                best_move.is_none() || score > alpha || (score == alpha && best_repeats && !repeats);
+
+            if better {
                 alpha = score;
                 best_move = Some(chess_move);
+                best_repeats = repeats;
             }
         }
 
@@ -1137,6 +1147,32 @@ mod tests {
             board.legal_moves().contains(&opening),
             "the book opened with {}, which is not legal",
             opening.coordinates()
+        );
+    }
+
+    // bare kings are insufficient material, so every move scores exactly 0 - the
+    // only thing left to decide between them is whether one repeats a position
+    // already reached, which the tie-break should steer away from
+    #[test]
+    fn a_tied_move_that_does_not_repeat_is_preferred() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 0); // a1
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 63); // h8
+
+        // shuffle both kings back to the start, so Ka1-a2 is now a move that has
+        // already been played from here once before
+        board.make_move_from_squares(0, 8, None); // Ka1-a2
+        board.make_move_from_squares(63, 55, None); // Kh8-h7
+        board.make_move_from_squares(8, 0, None); // Ka2-a1
+        board.make_move_from_squares(55, 63, None); // Kh7-h8
+
+        let result = find_best_move(&mut board, 1);
+        let best = result.best_move.expect("white has moves");
+
+        assert_ne!(
+            (best.from, best.to),
+            (0, 8),
+            "the search repeated Ka1-a2 over an equally scored fresh move"
         );
     }
 

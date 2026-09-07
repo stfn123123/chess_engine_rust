@@ -50,6 +50,8 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
                 divider(ui);
                 ui.add_space(16.0);
 
+                replay_controls_block(app, ui);
+
                 ui.columns(2, |columns| {
                     let left = &mut columns[0];
                     turn_block(app, left);
@@ -253,6 +255,9 @@ fn testing_blocks(app: &mut ChessApp, ui: &mut egui::Ui) {
     }
     ui.add_space(6.0);
 
+    autoplay_buttons(app, ui, full_width);
+    ui.add_space(6.0);
+
     // one run whatever the toggle says: with the engine off this is the only way to
     // search, and with it on it searches the same position again, for a second timing
     if panel_button(ui, "Run Search", ACCENT, egui::vec2(full_width, 34.0)) {
@@ -270,10 +275,130 @@ fn testing_blocks(app: &mut ChessApp, ui: &mut egui::Ui) {
     }
     ui.add_space(6.0);
 
+    if panel_button(ui, "Save Game", TEXT_PRIMARY, egui::vec2(full_width, 34.0)) {
+        app.save_game();
+    }
+    ui.add_space(6.0);
+
     perft_block(app, ui, full_width);
     ui.add_space(16.0);
 
     saved_positions_block(app, ui);
+    ui.add_space(16.0);
+
+    saved_games_block(app, ui);
+}
+
+// the game currently being stepped through, if any: which move it is on, and the
+// buttons to move through it or leave it - drawn full width, above the two columns,
+// since it is a mode the whole panel is in rather than one more testing control
+fn replay_controls_block(app: &mut ChessApp, ui: &mut egui::Ui) {
+    let Some((ply, total)) = app
+        .replay
+        .as_ref()
+        .map(|replay| (replay.ply, replay.moves.len()))
+    else {
+        return;
+    };
+
+    label(ui, "REPLAYING SAVED GAME");
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(format!("Move {ply} / {total}"))
+            .size(15.0)
+            .strong()
+            .color(TEXT_PRIMARY),
+    );
+    ui.add_space(8.0);
+
+    let full_width = ui.available_width();
+    ui.horizontal(|ui| {
+        let gap = ui.spacing().item_spacing.x;
+        let half = (full_width - gap) / 2.0;
+
+        if panel_button(ui, "< Previous", TEXT_PRIMARY, egui::vec2(half, 34.0)) {
+            app.replay_step(-1);
+        }
+        if panel_button(ui, "Next >", TEXT_PRIMARY, egui::vec2(half, 34.0)) {
+            app.replay_step(1);
+        }
+    });
+    ui.add_space(6.0);
+
+    if panel_button(ui, "Exit Replay", DANGER, egui::vec2(full_width, 30.0)) {
+        app.exit_replay();
+    }
+    ui.add_space(16.0);
+    divider(ui);
+    ui.add_space(16.0);
+}
+
+// the saved games, one row each: the label starts a replay, the cross forgets it
+fn saved_games_block(app: &mut ChessApp, ui: &mut egui::Ui) {
+    label(ui, "SAVED GAMES");
+    ui.add_space(6.0);
+
+    if app.saved_games.is_empty() {
+        ui.label(
+            egui::RichText::new("No games saved yet")
+                .size(13.0)
+                .color(TEXT_MUTED),
+        );
+        ui.add_space(18.0);
+        return;
+    }
+
+    // which row was clicked, decided while the list is only being read - starting a
+    // replay or forgetting a game on the spot would be changing the list being walked
+    let mut replay = None;
+    let mut forget = None;
+
+    for (index, saved) in app.saved_games.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let cross = 28.0;
+            let gap = ui.spacing().item_spacing.x;
+            let rest = (ui.available_width() - cross - gap).max(0.0);
+
+            if panel_button(ui, &saved.label, TEXT_PRIMARY, egui::vec2(rest, 28.0)) {
+                replay = Some(index);
+            }
+            if panel_button(ui, "\u{00d7}", DANGER, egui::vec2(cross, 28.0)) {
+                forget = Some(index);
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    ui.add_space(14.0);
+
+    if let Some(index) = replay {
+        app.start_replay(index);
+    }
+    if let Some(index) = forget {
+        app.forget_game(index);
+    }
+}
+
+// lets each side's moves be handed to the engine instead of played by hand - the
+// state it is in now, not the state a click would put it in, same as the evaluation
+// toggle above
+fn autoplay_buttons(app: &mut ChessApp, ui: &mut egui::Ui, full_width: f32) {
+    let (label, color) = match app.autoplay_white {
+        true => ("Autoplay White: On", CALM),
+        false => ("Autoplay White: Off", TEXT_MUTED),
+    };
+    if panel_button(ui, label, color, egui::vec2(full_width, 34.0)) {
+        app.autoplay_white = !app.autoplay_white;
+    }
+    ui.add_space(6.0);
+
+    let (label, color) = match app.autoplay_black {
+        true => ("Autoplay Black: On", CALM),
+        false => ("Autoplay Black: Off", TEXT_MUTED),
+    };
+    if panel_button(ui, label, color, egui::vec2(full_width, 34.0)) {
+        app.autoplay_black = !app.autoplay_black;
+    }
 }
 
 // perft: counts positions at a given depth, checked against published numbers

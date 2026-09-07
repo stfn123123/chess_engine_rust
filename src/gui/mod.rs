@@ -27,6 +27,9 @@ const PANEL_WIDTH: f32 = 480.0;
 const GAP: f32 = 18.0;
 // below this the board is unusable, so it stops shrinking with the window
 const MIN_BOARD_SIZE: f32 = 240.0;
+// autoplay waits this long after a move lands before playing the next one, so a game
+// reads as a sequence of moves rather than a flicker
+const AUTOPLAY_DELAY: Duration = Duration::from_millis(800);
 
 // what the last search found, and what it cost, as shown in the side panel
 struct SearchStats {
@@ -60,6 +63,25 @@ struct SavedPosition {
     board: Board,
     // what the row in the panel reads, e.g. "#1 White - 32p"
     label: String,
+}
+
+// a finished or in-progress game, saved permanently rather than only put aside for
+// this session - stepped back through move by move instead of jumped to directly
+struct SavedGame {
+    // the whole board, history included, so its move list can be replayed from move 1
+    board: Board,
+    // what the row in the panel reads, e.g. "Game #1 - 34 moves"
+    label: String,
+}
+
+// a saved game currently being stepped through; its own moves rather than an index
+// into saved_games, so forgetting other games while replaying cannot invalidate it
+struct Replay {
+    // the live game, put aside so exit_replay has it to come back to
+    live_board: Board,
+    moves: Vec<Move>,
+    // how many of them are shown on the board, 0 is the starting position
+    ply: usize,
 }
 
 // how urgently a status line should read
@@ -98,21 +120,36 @@ pub struct ChessApp {
     // whether the engine weighs and searches after every move - turned off, a position
     // can be set up a move at a time without waiting for a search at every click
     analysis_enabled: bool,
+    // when a side's flag is set, the engine plays its own best move the moment it is
+    // that side's turn, instead of waiting for a click
+    autoplay_white: bool,
+    autoplay_black: bool,
+    // when the board last changed, so autoplay can pace itself against it rather than
+    // playing moves back to back
+    last_move_at: Instant,
     // positions put aside to come back to, oldest first
     saved_positions: Vec<SavedPosition>,
+    // games saved permanently, oldest first
+    saved_games: Vec<SavedGame>,
+    // the game currently being stepped through, if any - while this is set the
+    // board shows a replay ply rather than the live game
+    replay: Option<Replay>,
 }
 
 impl ChessApp {
     fn new(settings: Settings) -> Self {
-        ChessApp::with_state(settings, true, storage::load())
+        ChessApp::with_state(settings, true, false, false, storage::load(), storage::load_games())
     }
 
     // a fresh game that keeps what belongs to the session rather than to the game:
-    // the analysis toggle and the positions put aside so far
+    // the analysis toggle, the autoplay toggles, and what was put aside or saved so far
     fn with_state(
         settings: Settings,
         analysis_enabled: bool,
+        autoplay_white: bool,
+        autoplay_black: bool,
         saved_positions: Vec<SavedPosition>,
+        saved_games: Vec<SavedGame>,
     ) -> Self {
         let mut board = Board::new();
         board.set_start_position();
@@ -137,15 +174,28 @@ impl ChessApp {
             perft_depth: 4,
             last_perft: None,
             analysis_enabled,
+            autoplay_white,
+            autoplay_black,
+            last_move_at: Instant::now(),
             saved_positions,
+            saved_games,
+            replay: None,
         };
         app.position_changed();
         app
     }
 
     fn reset(&mut self) {
-        let saved = std::mem::take(&mut self.saved_positions);
-        *self = ChessApp::with_state(self.settings, self.analysis_enabled, saved);
+        let saved_positions = std::mem::take(&mut self.saved_positions);
+        let saved_games = std::mem::take(&mut self.saved_games);
+        *self = ChessApp::with_state(
+            self.settings,
+            self.analysis_enabled,
+            self.autoplay_white,
+            self.autoplay_black,
+            saved_positions,
+            saved_games,
+        );
     }
 
     // the game has ended, so no more moves are taken
@@ -155,6 +205,7 @@ impl ChessApp {
 
     // status first, since the evaluation asks it whether the game is still running
     fn position_changed(&mut self) {
+        self.last_move_at = Instant::now();
         self.refresh_status();
         // the old count belongs to the position that was on the board before this one
         self.last_perft = None;
@@ -238,6 +289,85 @@ impl ChessApp {
         }
     }
 
+    // whether a saved game is on the board instead of the live one - moves are not
+    // taken and autoplay does not run while one is
+    fn is_replaying(&self) -> bool {
+        self.replay.is_some()
+    }
+
+    // saves the game as it stands, whether finished or not - unlike a stored position
+    // this survives being played on, and is meant to be stepped back through later
+    fn save_game(&mut self) {
+        let moves = self.board.moves_played().len();
+
+        self.saved_games.push(SavedGame {
+            board: self.board.clone(),
+            label: format!("Game #{} - {moves} moves", self.saved_games.len() + 1),
+        });
+        storage::save_games(&self.saved_games);
+    }
+
+    fn forget_game(&mut self, index: usize) {
+        if index < self.saved_games.len() {
+            self.saved_games.remove(index);
+            storage::save_games(&self.saved_games);
+        }
+    }
+
+    // starts stepping through a saved game from its first move, putting the live
+    // game aside so it can be returned to with exit_replay
+    fn start_replay(&mut self, index: usize) {
+        let Some(saved) = self.saved_games.get(index) else {
+            return;
+        };
+
+        self.replay = Some(Replay {
+            live_board: self.board.clone(),
+            moves: saved.board.moves_played(),
+            ply: 0,
+        });
+        self.apply_replay_ply();
+    }
+
+    // leaves replay and puts the live game back on the board exactly as it was
+    fn exit_replay(&mut self) {
+        let Some(replay) = self.replay.take() else {
+            return;
+        };
+
+        self.board = replay.live_board;
+        self.clear_selection();
+        self.position_changed();
+    }
+
+    // moves the replay forward or back by `delta` plies, clamped to the game's length
+    fn replay_step(&mut self, delta: isize) {
+        let Some(replay) = &mut self.replay else {
+            return;
+        };
+
+        let last_ply = replay.moves.len() as isize;
+        replay.ply = (replay.ply as isize + delta).clamp(0, last_ply) as usize;
+        self.apply_replay_ply();
+    }
+
+    // rebuilds the board from the start position up to the replay's current ply
+    fn apply_replay_ply(&mut self) {
+        let Some(replay) = &self.replay else {
+            return;
+        };
+
+        let mut board = Board::new();
+        board.set_start_position();
+        for chess_move in &replay.moves[..replay.ply] {
+            board.make_move(chess_move);
+        }
+
+        self.board = board;
+        self.clear_selection();
+        self.position_changed();
+    }
+
     // scores are for the side to move; the panel always shows white's point of view
     fn white_view(&self, score: i32) -> i32 {
         match self.board.turn() {
@@ -310,7 +440,7 @@ impl ChessApp {
     // handles a click on `square`: either plays the selected piece there, if that is
     // one of its legal destinations, or picks up whatever piece stands on it
     fn handle_click(&mut self, square: u8) {
-        if self.game_over() {
+        if self.game_over() || self.is_replaying() {
             return;
         }
 
@@ -346,10 +476,52 @@ impl ChessApp {
         self.selected = None;
         self.legal_targets.clear();
     }
+
+    // called once a frame: if the side to move has autoplay on, plays the move the
+    // engine found and asks for another frame straight away, so autoplay runs on its
+    // own instead of stalling until the next click or keypress
+    fn autoplay_step(&mut self, ctx: &egui::Context) {
+        if self.game_over() || self.is_replaying() {
+            return;
+        }
+
+        let enabled = match self.board.turn() {
+            Color::White => self.autoplay_white,
+            Color::Black => self.autoplay_black,
+        };
+        if !enabled {
+            return;
+        }
+
+        // wait out the pause before playing the next move, so the board is readable
+        // move to move rather than racing through the game
+        let elapsed = self.last_move_at.elapsed();
+        if elapsed < AUTOPLAY_DELAY {
+            ctx.request_repaint_after(AUTOPLAY_DELAY - elapsed);
+            return;
+        }
+
+        // analysis may be turned off, in which case nothing has searched this
+        // position yet - autoplay needs a move regardless of that toggle
+        if self.last_search.is_none() {
+            self.analyse_once();
+        }
+
+        let Some(best_move) = self.last_search.as_ref().and_then(|stats| stats.best_move) else {
+            return;
+        };
+
+        self.board.make_move(&best_move);
+        self.clear_selection();
+        self.position_changed();
+        ctx.request_repaint();
+    }
 }
 
 impl eframe::App for ChessApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.autoplay_step(ui.ctx());
+
         let available = ui.available_size();
         // the board is square, so it takes the smaller of what is left beside the
         // panel and the height of the window

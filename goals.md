@@ -20,7 +20,8 @@
   - idea: look at pieces positions and their psqt tables. prioritize pieces, that are on a negative psqt table entry.
   - goal: move pieces from bad spots to good spots.
 
-
+- import to pgn/fen notation
+- trading pieces leads to the same evaluation, however, when you are down in material it is not good.
 
 ## Performance
 - save all pieces positions?
