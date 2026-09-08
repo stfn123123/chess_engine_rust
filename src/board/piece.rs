@@ -58,6 +58,12 @@ impl PieceType {
         }
     }
 
+    // the row this type gets in a table with one entry per piece type - the bitboards
+    // and the evaluation tables both index that way, so they cannot drift apart
+    pub const fn board_index(self) -> usize {
+        self as usize - 1
+    }
+
     // the usual algebraic letter, lowercase
     // the type a letter stands for, as `letter` writes it
     pub fn from_letter(letter: char) -> Option<PieceType> {

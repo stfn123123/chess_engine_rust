@@ -9,6 +9,11 @@
 
 use crate::board::piece::Color;
 
+// a square as a single bit, so a set of squares fits into one number
+pub fn bit(square: u8) -> u64 {
+    1 << square
+}
+
 pub fn file_of(square: u8) -> u8 {
     square % 8
 }

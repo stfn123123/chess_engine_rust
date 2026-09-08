@@ -1,2 +1,4 @@
 # Project exclude paths
 /target/
+/assets/positions.txt
+/assets/games.txt

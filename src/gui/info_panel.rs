@@ -13,7 +13,7 @@ use super::theme::{
     TEXT_MUTED, TEXT_PRIMARY, WARNING, WHITE_SIDE,
 };
 use super::{ChessApp, Tone};
-use crate::board::piece::Color;
+use crate::board::piece::{Color, PieceType};
 use crate::evaluate::MATE;
 
 pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
@@ -65,6 +65,7 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
                     search_blocks(app, left);
 
                     testing_blocks(app, &mut columns[1]);
+                    bitboard_blocks(app, &mut columns[1]);
                 });
 
                 ui.add_space(4.0);
@@ -511,6 +512,65 @@ fn panel_button(
         .min_size(size);
 
     ui.add(button).clicked()
+}
+
+// one switch per bitboard, so a board can be put on the position and watched through
+// the move types that are worth seeing rather than trusting
+fn bitboard_blocks(app: &mut ChessApp, ui: &mut egui::Ui) {
+    ui.add_space(10.0);
+    divider(ui);
+    ui.add_space(14.0);
+
+    ui.label(
+        egui::RichText::new("BITBOARDS")
+            .size(12.0)
+            .strong()
+            .color(ACCENT),
+    );
+    ui.add_space(10.0);
+
+    ui.columns(2, |columns| {
+        for (column, color) in columns.iter_mut().zip(Color::BOTH) {
+            label(
+                column,
+                match color {
+                    Color::White => "WHITE",
+                    Color::Black => "BLACK",
+                },
+            );
+            column.add_space(4.0);
+
+            let width = column.available_width();
+            for piece_type in PieceType::ALL {
+                let shown = &mut app.shown_bitboards[color.index()][piece_type.board_index()];
+                // lit when the board is on the position, the same way the toggles above read
+                let text_color = if *shown { CALM } else { TEXT_MUTED };
+
+                if panel_button(column, piece_name(piece_type), text_color, egui::vec2(width, 26.0))
+                {
+                    *shown = !*shown;
+                }
+                column.add_space(4.0);
+            }
+        }
+    });
+
+    ui.add_space(4.0);
+    let full_width = ui.available_width();
+    if panel_button(ui, "Clear All", TEXT_MUTED, egui::vec2(full_width, 30.0)) {
+        app.shown_bitboards = [[false; 6]; 2];
+    }
+}
+
+fn piece_name(piece_type: PieceType) -> &'static str {
+    match piece_type {
+        PieceType::King => "King",
+        PieceType::Pawn => "Pawn",
+        PieceType::Knight => "Knight",
+        PieceType::Bishop => "Bishop",
+        PieceType::Rook => "Rook",
+        PieceType::Queen => "Queen",
+    }
 }
 
 // a small caps label with the number underneath it, the way a scoreboard reads

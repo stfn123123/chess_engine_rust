@@ -22,42 +22,49 @@ use crate::board::castling::{
 use crate::board::chess_move::Move;
 use crate::board::piece::{Color, Piece, PieceType};
 use crate::board::square::{
-    DIAGONAL_STEPS, KING_STEPS, KNIGHT_STEPS, STRAIGHT_STEPS, direction_between,
+    DIAGONAL_STEPS, KING_STEPS, KNIGHT_STEPS, STRAIGHT_STEPS, bit, direction_between,
     en_passant_captured_square, offset, rank_of, ray, squares_between,
 };
 
 impl Board {
     // every legal move of one side, castling included
     pub(crate) fn legal_moves_for(&self, color: Color) -> Vec<Move> {
-        self.generate(color, false)
+        // a position holds around forty moves, and far fewer captures
+        let mut moves = Vec::with_capacity(48);
+        self.generate_into(&mut moves, color, false);
+        moves
     }
 
     // only the moves that take something - what quiescence walks
     pub(crate) fn legal_captures_for(&self, color: Color) -> Vec<Move> {
-        self.generate(color, true)
+        let mut moves = Vec::with_capacity(16);
+        self.generate_into(&mut moves, color, true);
+        moves
     }
 
-    fn generate(&self, color: Color, captures_only: bool) -> Vec<Move> {
+    // appends onto whatever the caller hands over, so a search that walks millions of
+    // nodes can pass the same list round instead of allocating one per node
+    pub(crate) fn generate_into(&self, moves: &mut Vec<Move>, color: Color, captures_only: bool) {
         // a hand built board without a king has no king to keep safe
         let Some(king_square) = self.king_square(color) else {
-            let mut moves = self.pseudo_legal_moves(color);
+            // hand built boards only, so the list this makes is not worth saving
+            let mut pseudo = self.pseudo_legal_moves(color);
             if captures_only {
-                moves.retain(|candidate| candidate.captured.is_some());
+                pseudo.retain(|candidate| candidate.captured.is_some());
             }
-            return moves;
+            moves.append(&mut pseudo);
+            return;
         };
 
-        // a position holds around forty moves, and far fewer captures
-        let mut moves = Vec::with_capacity(if captures_only { 16 } else { 48 });
         let king = Piece::new(PieceType::King, color);
-        self.king_moves(&mut moves, king, king_square, captures_only);
+        self.king_moves(moves, king, king_square, captures_only);
 
         let safety = self.evaluate_pins(color.opponent());
 
         // against two checkers only the king can help: no single move takes two pieces
         // off the board, and blocking one line leaves the other one open
         if safety.checkers.count >= 2 {
-            return moves;
+            return;
         }
 
         // the squares a move has to end on to answer the check - the checking piece
@@ -66,9 +73,6 @@ impl Board {
             Some(checker) => bit(checker) | ray_between(king_square, checker),
             None => u64::MAX,
         };
-
-        // one buffer for the whole walk, emptied and refilled per piece
-        let mut candidates = Vec::with_capacity(32);
 
         // walking the squares once and dispatching on what stands there beats asking
         // for the squares of all six piece types one after the other
@@ -87,10 +91,15 @@ impl Board {
                 None => answers_check,
             };
 
-            candidates.clear();
-            self.moves_for_piece(&mut candidates, piece, from);
+            // this piece writes onto the end of the list and the moves it may not play
+            // are taken off again, which saves a second list to sort them out in
+            let start = moves.len();
+            self.moves_for_piece(moves, piece, from);
 
-            for &candidate in &candidates {
+            let mut kept = start;
+            for index in start..moves.len() {
+                let candidate = moves[index];
+
                 // before the legality scan, which is the expensive half
                 if captures_only && candidate.captured.is_none() {
                     continue;
@@ -105,18 +114,18 @@ impl Board {
                 };
 
                 if legal {
-                    moves.push(candidate);
+                    moves[kept] = candidate;
+                    kept += 1;
                 }
             }
+            moves.truncate(kept);
         }
 
         // castling out of check is never allowed; castle_moves itself refuses to castle
         // through or into an attacked square. A castle never takes anything
         if !captures_only && safety.checkers.count == 0 {
-            self.castle_moves(&mut moves, color);
+            self.castle_moves(moves, color);
         }
-
-        moves
     }
 
     // every move of one side that follows the movement rules, whether or not it leaves
@@ -654,11 +663,6 @@ impl KingSafety {
             .find(|pin| pin.square == square)
             .map(|pin| pin.ray)
     }
-}
-
-// a square as a single bit, so that a set of squares fits into one number
-fn bit(square: u8) -> u64 {
-    1 << square
 }
 
 // the squares strictly between two squares that share a rank, file or diagonal - empty

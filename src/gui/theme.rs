@@ -24,6 +24,18 @@ pub const CALM: egui::Color32 = egui::Color32::from_rgb(126, 186, 128);
 pub const WARNING: egui::Color32 = egui::Color32::from_rgb(232, 168, 84);
 pub const DANGER: egui::Color32 = egui::Color32::from_rgb(214, 106, 96);
 
+// one colour per piece type for the bitboard overlay. Premultiplied at alpha 110, so
+// the square and the piece standing on it still read through the tint
+pub const BB_KING: egui::Color32 = egui::Color32::from_rgba_premultiplied(99, 82, 26, 110);
+pub const BB_PAWN: egui::Color32 = egui::Color32::from_rgba_premultiplied(47, 86, 52, 110);
+pub const BB_KNIGHT: egui::Color32 = egui::Color32::from_rgba_premultiplied(39, 82, 93, 110);
+pub const BB_BISHOP: egui::Color32 = egui::Color32::from_rgba_premultiplied(78, 56, 95, 110);
+pub const BB_ROOK: egui::Color32 = egui::Color32::from_rgba_premultiplied(99, 60, 30, 110);
+pub const BB_QUEEN: egui::Color32 = egui::Color32::from_rgba_premultiplied(99, 47, 73, 110);
+
+// the two sides share the colours above, so the black boards get an inset edge
+pub const BB_BLACK_EDGE: egui::Color32 = egui::Color32::from_rgb(22, 20, 18);
+
 // one colour per search number, so the panel can be read without looking at labels
 pub const STAT_TIME: egui::Color32 = egui::Color32::from_rgb(132, 172, 214);
 pub const STAT_SPEED: egui::Color32 = egui::Color32::from_rgb(126, 186, 128);

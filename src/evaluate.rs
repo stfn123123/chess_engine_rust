@@ -197,7 +197,7 @@ pub fn evaluate(board: &Board) -> i32 {
 }
 
 pub fn piece_value(piece_type: PieceType) -> i16 {
-    BASE_VALUES[piece_type as usize - 1]
+    BASE_VALUES[piece_type.board_index()]
 }
 
 
@@ -214,7 +214,7 @@ fn color_index(color: Color) -> usize {
 }
 
 fn piece_score(piece_type: PieceType, color: Color, square: u8) -> i16 {
-    let index = piece_type as usize - 1;
+    let index = piece_type.board_index();
     BASE_VALUES[index] + TABLES[index][table_index(square, color)]
 }
 

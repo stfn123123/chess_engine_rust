@@ -43,7 +43,7 @@ use crate::opening::OpeningBook;
 use crate::transposition::{NodeType, TranspositionTable};
 
 // how deep the search runs unless something asks for another depth
-pub const DEFAULT_DEPTH: u32 = 6;
+pub const DEFAULT_DEPTH: u32 = 8;
 
 const INFINITY: i32 = 1_000_000;
 
@@ -88,6 +88,9 @@ pub struct Search {
     // the nodes of the search that is running, counted from its root
     positions_searched: u64,
     positions_searched_quiescience: u64,
+    // move lists already allocated, lent to a node and taken back when it is done; the
+    // search is depth first, so no more of them are ever needed than the tree is deep
+    orders: Vec<MoveOrder>,
 }
 
 impl Search {
@@ -97,6 +100,7 @@ impl Search {
             book: Some(OpeningBook::new()),
             positions_searched: 0,
             positions_searched_quiescience: 0,
+            orders: Vec::new(),
         }
     }
 
@@ -142,15 +146,33 @@ impl Search {
         }
     }
 
+    // a move list to work in, the one the last node finished with where there is one
+    fn take_order(&mut self) -> MoveOrder {
+        self.orders.pop().unwrap_or_else(MoveOrder::new)
+    }
+
+    // handed back on every way out of a node, cutoffs included, or the pile runs dry
+    // and the nodes below start allocating again
+    fn give_back(&mut self, order: MoveOrder) {
+        self.orders.push(order);
+    }
+
     // like alpha_beta with the window wide open, but must return a move
     fn search_root(&mut self, board: &mut Board, depth: u32) -> (Option<Move>, i32) {
+        // usually still the answer to what the opponent just did
+        let table_move = self.table.best_move(board.hash());
+
+        let mut order = self.take_order();
+        order.load(board, table_move);
+
         // nothing to search: the game is over, or the caller asked for no depth at all
-        let moves = board.legal_moves();
-        if moves.is_empty() {
+        if order.moves.is_empty() {
+            self.give_back(order);
             return (None, terminal_score(board, 0));
         }
 
         if depth == 0 {
+            self.give_back(order);
             return (None, self.quiescence(board, -INFINITY, INFINITY, 0));
         }
 
@@ -160,10 +182,7 @@ impl Search {
         let mut best_repeats = false;
         let mut alpha = -INFINITY;
 
-        // usually still the answer to what the opponent just did
-        let table_move = self.table.best_move(board.hash());
-
-        for chess_move in MoveOrder::new(board, moves, table_move) {
+        while let Some(chess_move) = order.next() {
             board.make_move(&chess_move);
             let score = -self.alpha_beta(board, depth - 1, -INFINITY, -alpha, 1);
             let repeats = board.position_repetitions() > 1;
@@ -180,6 +199,8 @@ impl Search {
                 best_repeats = repeats;
             }
         }
+
+        self.give_back(order);
 
         // nothing was cut off up here, so this is what the position is worth
         self.table
@@ -216,13 +237,17 @@ impl Search {
         }
 
         // the move list is in hand here, so whether the game ended costs nothing to ask
-        let moves = board.legal_moves();
-        if moves.is_empty() {
+        let mut order = self.take_order();
+        order.load(board, probe.best_move);
+
+        if order.moves.is_empty() {
+            self.give_back(order);
             return terminal_score(board, ply);
         }
 
         // a mate on the last ply of the fifty still counts as mate, not a draw
         if board.is_fifty_move_draw() {
+            self.give_back(order);
             return 0;
         }
 
@@ -231,12 +256,14 @@ impl Search {
         let mut node_type = NodeType::UpperBound;
         let mut best_move = None;
 
-        for chess_move in MoveOrder::new(board, moves, probe.best_move) {
+        while let Some(chess_move) = order.next() {
             board.make_move(&chess_move);
             let score = -self.alpha_beta(board, depth - 1, -beta, -alpha, ply + 1);
             board.undo_move();
 
             if score >= beta {
+                self.give_back(order);
+
                 // beta is only a floor here, and this is the move to try first next time
                 self.table.store(
                     board.hash(),
@@ -256,6 +283,8 @@ impl Search {
             }
         }
 
+        self.give_back(order);
+
         self.table
             .store(board.hash(), depth, ply, alpha, node_type, best_move);
 
@@ -270,17 +299,23 @@ impl Search {
 
         // no standing pat out of a check, and every evasion counts, not only the captures
         if board.is_check(board.turn()) {
-            let moves = board.legal_moves();
-            if moves.is_empty() {
+            // ordered like any other node: an evasion is as often a quiet block as a
+            // capture. Never pruned - drop them all and a mate reads as a score
+            let mut order = self.take_order();
+            order.load(board, None);
+
+            if order.moves.is_empty() {
+                self.give_back(order);
                 return terminal_score(board, ply);
             }
 
-            for chess_move in moves {
+            while let Some(chess_move) = order.next() {
                 board.make_move(&chess_move);
                 let score = -self.quiescence(board, -beta, -alpha, ply + 1);
                 board.undo_move();
 
                 if score >= beta {
+                    self.give_back(order);
                     return beta;
                 }
                 if score > alpha {
@@ -288,6 +323,7 @@ impl Search {
                 }
             }
 
+            self.give_back(order);
             return alpha;
         }
 
@@ -303,7 +339,10 @@ impl Search {
         // the same for every capture here, so it is worked out once
         let margin = delta_margin(board);
 
-        for chess_move in MoveOrder::captures(board.legal_captures()) {
+        let mut order = self.take_order();
+        order.load_captures(board);
+
+        while let Some(chess_move) = order.next() {
             // delta pruning: winning this piece for free still would not reach alpha
             if stand_pat + optimistic_gain(&chess_move) + margin < alpha {
                 continue;
@@ -319,6 +358,7 @@ impl Search {
             board.undo_move();
 
             if score >= beta {
+                self.give_back(order);
                 return beta;
             }
             if score > alpha {
@@ -326,6 +366,7 @@ impl Search {
             }
         }
 
+        self.give_back(order);
         alpha
     }
 }
@@ -341,36 +382,40 @@ struct MoveOrder {
 }
 
 impl MoveOrder {
-    // scored move list, with the table's move for this position - if it has one - in front
-    fn new(board: &Board, moves: Vec<Move>, table_move: Option<Move>) -> MoveOrder {
-        let mut scores = [0; MAX_MOVES];
-        for (index, chess_move) in moves.iter().enumerate() {
-            scores[index] = if Some(*chess_move) == table_move {
+    // an empty one, to be filled by one of the two loads below
+    fn new() -> MoveOrder {
+        MoveOrder {
+            moves: Vec::with_capacity(48),
+            scores: [0; MAX_MOVES],
+            handed_out: 0,
+        }
+    }
+
+    // scored move list, with the table's move for this position - if it has one - in
+    // front; filled in place, so a reused MoveOrder allocates nothing at all
+    fn load(&mut self, board: &Board, table_move: Option<Move>) {
+        board.legal_moves_into(&mut self.moves);
+
+        for (index, chess_move) in self.moves.iter().enumerate() {
+            self.scores[index] = if Some(*chess_move) == table_move {
                 TABLE_MOVE_SCORE
             } else {
                 move_score(board, chess_move)
             };
         }
 
-        MoveOrder {
-            moves,
-            scores,
-            handed_out: 0,
-        }
+        self.handed_out = 0;
     }
 
     // what quiescence walks: captures, with nothing but MVV-LVA to tell them apart
-    fn captures(captures: Vec<Move>) -> MoveOrder {
-        let mut scores = [0; MAX_MOVES];
-        for (index, chess_move) in captures.iter().enumerate() {
-            scores[index] = capture_score(chess_move);
+    fn load_captures(&mut self, board: &Board) {
+        board.legal_captures_into(&mut self.moves);
+
+        for (index, chess_move) in self.moves.iter().enumerate() {
+            self.scores[index] = capture_score(chess_move);
         }
 
-        MoveOrder {
-            moves: captures,
-            scores,
-            handed_out: 0,
-        }
+        self.handed_out = 0;
     }
 }
 
@@ -894,8 +939,9 @@ mod tests {
         board.add_piece(Piece::new(PieceType::Queen, Color::Black), 56); // a8
         board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 41); // b6
 
-        let moves = board.legal_moves();
-        let ordered: Vec<Move> = MoveOrder::new(&board, moves, None).collect();
+        let mut order = MoveOrder::new();
+        order.load(&board, None);
+        let ordered: Vec<Move> = order.collect();
 
         let first = ordered.first().expect("white has moves");
         assert_eq!((first.from, first.to), (0, 56), "Rxa8 was not searched first");
@@ -910,7 +956,9 @@ mod tests {
         let board = start_position();
         let moves = board.legal_moves();
 
-        let ordered: Vec<Move> = MoveOrder::new(&board, moves.clone(), None).collect();
+        let mut order = MoveOrder::new();
+        order.load(&board, None);
+        let ordered: Vec<Move> = order.collect();
 
         assert_eq!(ordered.len(), moves.len(), "the move list changed length");
         for chess_move in &moves {
@@ -1125,7 +1173,9 @@ mod tests {
             .find(|chess_move| (chess_move.from, chess_move.to) == (1, 18))
             .expect("Nb1c3 is legal");
 
-        let ordered: Vec<Move> = MoveOrder::new(&board, moves, Some(table_move)).collect();
+        let mut order = MoveOrder::new();
+        order.load(&board, Some(table_move));
+        let ordered: Vec<Move> = order.collect();
 
         assert_eq!(ordered[0], table_move, "the stored move was not searched first");
     }

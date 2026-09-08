@@ -13,7 +13,6 @@ use super::{SavedGame, SavedPosition};
 use crate::board::Board;
 use crate::board::chess_move::parse_coordinates;
 
-const APP_DIRECTORY: &str = "chess_engine";
 const POSITIONS_FILE_NAME: &str = "positions.txt";
 const GAMES_FILE_NAME: &str = "games.txt";
 
@@ -94,17 +93,9 @@ fn read_line(line: &str) -> Option<(String, Board)> {
     Some((label.to_string(), board))
 }
 
-// %APPDATA%\chess_engine on windows, ~/.config/chess_engine elsewhere
+// <project>/assets, alongside the opening books
 fn config_dir() -> Option<PathBuf> {
-    let base = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-    }?;
-
-    Some(base.join(APP_DIRECTORY))
+    Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"))
 }
 
 fn positions_file_path() -> Option<PathBuf> {

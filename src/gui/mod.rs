@@ -134,6 +134,9 @@ pub struct ChessApp {
     // the game currently being stepped through, if any - while this is set the
     // board shows a replay ply rather than the live game
     replay: Option<Replay>,
+    // which of the board's bitboards are painted over the position, indexed as they are -
+    // a way to watch one through a promotion, an en passant or a castle
+    shown_bitboards: [[bool; 6]; 2],
 }
 
 impl ChessApp {
@@ -180,6 +183,7 @@ impl ChessApp {
             saved_positions,
             saved_games,
             replay: None,
+            shown_bitboards: [[false; 6]; 2],
         };
         app.position_changed();
         app
@@ -188,6 +192,8 @@ impl ChessApp {
     fn reset(&mut self) {
         let saved_positions = std::mem::take(&mut self.saved_positions);
         let saved_games = std::mem::take(&mut self.saved_games);
+        // belongs to the session rather than to the game, like the toggles above it
+        let shown_bitboards = self.shown_bitboards;
         *self = ChessApp::with_state(
             self.settings,
             self.analysis_enabled,
@@ -196,6 +202,7 @@ impl ChessApp {
             saved_positions,
             saved_games,
         );
+        self.shown_bitboards = shown_bitboards;
     }
 
     // the game has ended, so no more moves are taken

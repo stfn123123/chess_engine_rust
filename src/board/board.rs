@@ -4,7 +4,7 @@
 use crate::board::castling::{CastleSide, CastlingRights, rook_castle_square, rook_start_square};
 use crate::board::chess_move::{Move, MoveRecord};
 use crate::board::piece::{Color, Piece, PieceType};
-use crate::board::square::{en_passant_captured_square, file_of, offset, rank_of};
+use crate::board::square::{bit, en_passant_captured_square, file_of, offset, rank_of};
 use crate::board::zobrist::ZOBRIST;
 
 // cloned to put a position aside and come back to it later, history and all - the
@@ -13,6 +13,11 @@ use crate::board::zobrist::ZOBRIST;
 pub struct Board {
     turn: Color,
     squares: [Option<Piece>; 64],
+    // the same pieces the other way round, indexed [Color::index][PieceType::board_index]:
+    // the mailbox says what stands here, these say where a piece type stands
+    pieces: [[u64; 6]; 2],
+    // the six boards of a side or-ed together, kept rather than worked out on demand
+    occupied: [u64; 2],
     // where each king stands, indexed by Color::index - kept here because the move
     // generator asks for it several times per position
     king_squares: [Option<u8>; 2],
@@ -47,6 +52,8 @@ impl Board {
         Board {
             turn: Color::White,
             squares: [None; 64],
+            pieces: [[0; 6]; 2],
+            occupied: [0; 2],
             king_squares: [None; 2],
             history: Vec::new(),
             position_keys: Vec::new(),
@@ -126,6 +133,18 @@ impl Board {
     // the raw count, so a promotion can push it past a full board
     pub fn phase(&self) -> i32 {
         self.phase
+    }
+
+    // the squares holding that piece type and color, as one number per square bit
+    pub fn piece_board(&self, piece_type: PieceType, color: Color) -> u64 {
+        self.pieces[color.index()][piece_type.board_index()]
+    }
+
+    // every square that side has a piece on - nothing reads it yet, it is what the
+    // move generator and the attack scan will be rewritten against
+    #[allow(dead_code)]
+    pub fn occupied_by(&self, color: Color) -> u64 {
+        self.occupied[color.index()]
     }
 
     // every square holding a piece of that type and color
@@ -244,6 +263,8 @@ impl Board {
             "king squares drifted"
         );
         debug_assert_eq!(self.phase, self.counted_phase(), "phase drifted");
+        debug_assert_eq!(self.pieces, self.counted_pieces(), "bitboards drifted");
+        debug_assert_eq!(self.occupied, self.counted_occupied(), "occupancy drifted");
         debug_assert_eq!(
             self.position_keys.len(),
             self.history.len(),
@@ -303,6 +324,8 @@ impl Board {
             "king squares drifted"
         );
         debug_assert_eq!(self.phase, self.counted_phase(), "phase drifted");
+        debug_assert_eq!(self.pieces, self.counted_pieces(), "bitboards drifted");
+        debug_assert_eq!(self.occupied, self.counted_occupied(), "occupancy drifted");
         debug_assert_eq!(
             self.position_keys.len(),
             self.history.len(),
@@ -359,6 +382,18 @@ impl Board {
     // only the moves that take something, for the quiescence search
     pub fn legal_captures(&self) -> Vec<Move> {
         self.legal_captures_for(self.turn)
+    }
+
+    // the same two lists, refilled into a list the caller keeps hold of: the search
+    // walks millions of nodes, and passing one list round beats allocating per node
+    pub fn legal_moves_into(&self, moves: &mut Vec<Move>) {
+        moves.clear();
+        self.generate_into(moves, self.turn, false);
+    }
+
+    pub fn legal_captures_into(&self, moves: &mut Vec<Move>) {
+        moves.clear();
+        self.generate_into(moves, self.turn, true);
     }
 
     // is the king of the given side in check
@@ -508,13 +543,20 @@ pub fn insufficient_minors(bishops: [usize; 2], knights: [usize; 2]) -> bool {
 
 // -------------------- keeping the hash in sync --------------------
 impl Board {
-    // every write to a square goes through here, so the hash, the king squares and the
-    // phase stay in sync - xor is its own inverse, so taking off and putting on are one
+    // every write to a square goes through here, so the hash, the king squares, the
+    // phase and the bitboards stay in sync - xor is its own inverse, so taking off and
+    // putting on are one
     fn set_square(&mut self, square: u8, piece: Option<Piece>) {
         if let Some(previous) = self.squares[square as usize] {
             self.hash ^= ZOBRIST.piece(square, previous);
             // no guard needed here: this counts what is standing, not where it stands
             self.phase -= previous.piece_type().phase_weight();
+
+            // xor both ways round, for the same reason the hash above may: a square
+            // holds one piece, and the old one always comes off before a new one goes on
+            self.pieces[previous.color().index()][previous.piece_type().board_index()] ^=
+                bit(square);
+            self.occupied[previous.color().index()] ^= bit(square);
 
             // only clear when this is still the recorded square: a move writes the king
             // onto `to` before clearing `from`, and that write already moved the record
@@ -527,6 +569,9 @@ impl Board {
         if let Some(piece) = piece {
             self.hash ^= ZOBRIST.piece(square, piece);
             self.phase += piece.piece_type().phase_weight();
+
+            self.pieces[piece.color().index()][piece.piece_type().board_index()] ^= bit(square);
+            self.occupied[piece.color().index()] ^= bit(square);
 
             if piece.is(PieceType::King) {
                 self.king_squares[piece.color().index()] = Some(square);
@@ -588,6 +633,24 @@ impl Board {
             .rev()
             .take_while(|record| !record.chess_move.is_irreversible())
             .count() as u16
+    }
+
+    // the bitboards rebuilt from the mailbox, for the debug_asserts to check against -
+    // the two ways of holding the position have to agree square for square
+    fn counted_pieces(&self) -> [[u64; 6]; 2] {
+        let mut pieces = [[0; 6]; 2];
+        for (square, occupant) in self.squares.iter().enumerate() {
+            if let Some(piece) = occupant {
+                pieces[piece.color().index()][piece.piece_type().board_index()] |=
+                    bit(square as u8);
+            }
+        }
+        pieces
+    }
+
+    fn counted_occupied(&self) -> [u64; 2] {
+        self.counted_pieces()
+            .map(|boards| boards.iter().fold(0, |all, board| all | board))
     }
 
     // the phase counted from scratch, for the debug_asserts to check against
