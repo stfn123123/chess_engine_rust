@@ -247,6 +247,40 @@ fn search_blocks(app: &ChessApp, ui: &mut egui::Ui) {
         STAT_EVAL,
     );
 
+    // how often the move ordering had the refutation in hand right away: above ~90% the
+    // ordering is close to all it can be, and a narrower window has little left to save
+    let first_move_share = if stats.beta_cutoffs > 0 {
+        stats.first_move_cutoffs as f64 / stats.beta_cutoffs as f64 * 100.0
+    } else {
+        0.0
+    };
+    stat_block(
+        ui,
+        "FIRST MOVE CUTOFFS",
+        &format!(
+            "{} ({first_move_share:.1}%)",
+            format_count(stats.first_move_cutoffs)
+        ),
+        STAT_EVAL,
+    );
+
+    // how often a reduced move turned out to be worth a full search after all: the reductions
+    // are paying while this stays low, and every one of them cost a second search
+    let research_share = if stats.lmr_reductions > 0 {
+        stats.lmr_researches as f64 / stats.lmr_reductions as f64 * 100.0
+    } else {
+        0.0
+    };
+    stat_block(
+        ui,
+        "LMR REDUCTIONS",
+        &format!(
+            "{} ({research_share:.1}% redone)",
+            format_count(stats.lmr_reductions)
+        ),
+        STAT_EVAL,
+    );
+
     deepening_block(app, ui, stats);
 }
 

@@ -1,4 +1,34 @@
-# Evaluation
+# Search & Evaluation
+Search (biggest gaps)
+- Principal Variation Search
+- Zero/Null Window Search
+- improving move ordering
+- improving evaluation
+    - Pawn structure
+    - king safety
+
+- improve qsence
+
+## Performance
+- MoveOrder (search.rs, ~60 lines) could be one line instead: `moves.sort_by_cached_key(|m| -move_score(board, m))`.
+  Both score every move once, which is where ~90% of the win over the old sort_unstable_by_key came from. The
+  one-liner allocates a Vec per node and orders moves the search never reaches; MoveOrder uses a stack array and
+  stops picking when the search stops asking, but is quadratic at nodes where every move gets searched.
+  Expected to be roughly a wash - TEST IT, compare nodes/sec in the info panel.
+  Keep MoveOrder only if the incremental interface is wanted for the TT move / killers / staged generation.
+
+
+## Gameplay
+- add different time modes and increment
+- connect to lichess using the api
+
+
+
+
+
+
+
+
 
 # Bitboards
 generate_into and evaluate iterate pieces[color][type] now, and the sliders read the
@@ -26,32 +56,3 @@ binary layout rather than anything in the code, and the SEE rewrite is worth tak
 its own sake. One more thing left on the table either way: the RAYS index still carries a
 bounds check, because the compiler cannot prove a bitscan result is under 64 - writing it
 as (blockers.trailing_zeros() & 63) makes it provable without unsafe.
-
-
-## Performance
-- MoveOrder (search.rs, ~60 lines) could be one line instead: `moves.sort_by_cached_key(|m| -move_score(board, m))`.
-Both score every move once, which is where ~90% of the win over the old sort_unstable_by_key came from. The
-one-liner allocates a Vec per node and orders moves the search never reaches; MoveOrder uses a stack array and
-stops picking when the search stops asking, but is quadratic at nodes where every move gets searched.
-Expected to be roughly a wash - TEST IT, compare nodes/sec in the info panel.
-Keep MoveOrder only if the incremental interface is wanted for the TT move / killers / staged generation.
-
-# Search
-Search (biggest gaps — you're missing the standard stack)
-
-2. no history heuristic.
-   move_score (search.rs:441) scores captures via MVV-LVA and promotions, and everything else 0 minus a pawn-attack penalty. Quiet moves are effectively unordered — and quiet moves are most of the tree. Two killer slots per ply plus a [color][from][to] history table are ~40 lines and typically the second-biggest win after ID.
-
-3. No PVS, no LMR, no null-move pruning, no extensions.
-   Every move gets a full window (search.rs:236). Null-window re-search after the first move (PVS), reducing late quiet moves (LMR), and null-move pruning are what turn depth 8 into depth 12+ at the same node count. Check extensions too — nothing extends anywhere.
-
-4. Fail-hard, and quiescence is uncapped.
-   return beta / storing beta (search.rs:245) throws away information a fail-soft return score would keep for the TT. Separately, the in-check branch of quiescence (search.rs:281) recurses on all legal moves with no ply limit — a perpetual-check position can go arbitrarily deep. Cap it. Quiescence also never probes or stores the TT.
-
-
-## Gameplay
-- add different time modes and increment
-- add bot vs bot, bot vs player
-
-## Connect to Lichess
-- using the api

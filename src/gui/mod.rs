@@ -56,6 +56,11 @@ struct SearchStats {
     // killers of that ply supplied - the share is what says the killers are working
     beta_cutoffs: u64,
     killer_cutoffs: u64,
+    // of those cutoffs, the ones the very first move tried already caused
+    first_move_cutoffs: u64,
+    // late moves searched a ply or two short, and how many of those the search had to redo in full
+    lmr_reductions: u64,
+    lmr_researches: u64,
 }
 
 // what a position count found, and what it cost
@@ -419,6 +424,9 @@ impl ChessApp {
             passes: result.passes,
             beta_cutoffs: result.beta_cutoffs,
             killer_cutoffs: result.killer_cutoffs,
+            first_move_cutoffs: result.first_move_cutoffs,
+            lmr_reductions: result.lmr_reductions,
+            lmr_researches: result.lmr_researches,
         });
     }
 

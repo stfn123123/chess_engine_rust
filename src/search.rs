@@ -52,40 +52,60 @@ pub const DEFAULT_DEPTH: u32 = 10;
 
 const INFINITY: i32 = 1_000_000;
 
-// the most moves a position has ever been found to allow is 218, so a list never
-// outgrows this - it is the size of the score buffer the ordering picks out of
+// 218 legal moves is the most ever found in a position; the score buffer sizes to that
 const MAX_MOVES: usize = 256;
 
-// how far short of alpha a capture may fall and still be worth looking at - covers
-// the piece-square swing of both pieces, which is not known before the move is played
+// how far short of alpha a capture may fall and still be worth looking at
 const DELTA_MARGIN: i32 = 200;
 
-// at or below this phase the margin is dropped: a pawn decides an endgame, and there is
-// little piece-square swing left to cover once the pieces are off
+// dropped at or below this phase: a pawn decides an endgame, so there's little left to cover
 const DELTA_ENDGAME_PHASE: f32 = 0.25;
 
-// the move the table kept, put ahead of anything the guesswork below can score
+// the move the table kept, ranked ahead of anything the guesswork below can score
 const TABLE_MOVE_SCORE: i32 = 1_000_000;
 
-// how deep the killers are kept for. Quiescence carries the ply count past the depth
-// the search was asked for, so this is a bound on the whole tree, not on the depth
+// bound on the whole tree, not just the requested depth - quiescence carries ply past it
 const MAX_PLY: usize = 128;
 
-// how many quiet moves are remembered per ply. Two is what the idea is worth: the
-// first is nearly always the one that cuts again, and a third crowds out the captures
+// two per ply: the first is almost always the one that cuts again, a third crowds out captures
 const KILLERS_PER_PLY: usize = 2;
 
-// where a killer is handed out: after every capture, the cheapest of which is a queen
-// taking a pawn at 100, and before every ordinary quiet move, which scores 0 or less.
-// The second killer is the older one, so it goes behind the first
+// killers rank after every capture and before ordinary quiet moves; second slot is the older killer
 const KILLER_SCORES: [i32; KILLERS_PER_PLY] = [99, 98];
 
-// a node that has no killers to offer - the root, and everything quiescence looks at
+// no killers to offer - the root, and everything quiescence looks at
 const NO_KILLERS: [Option<Move>; KILLERS_PER_PLY] = [None; KILLERS_PER_PLY];
 
-// what the king is worth to an exchange: it can never be taken, so it has to outweigh
-// anything winning it could bring in
+// the king can never be taken, so it must outweigh anything winning it could bring in
 const SEE_KING_VALUE: i32 = 10_000;
+
+// TODO unverified: LMR is new and only measured on one position, at depth 10 with a 256 MB table.
+// Before it: 63.21M nodes / 24.59s / 2,571k nps. After: 7.18M / 2.64s / 2,723k nps, 221,548
+// reductions of which 0.2% were re-searched. It is the first change here that can alter the move
+// found rather than only the speed, so it is not to be trusted until:
+//   - the test suite passes; a few tests assert a best move at depth 4-5, inside LMR's range
+//   - move and score match the pre-LMR search on many positions, mates included. A mate the old
+//     search found and this one misses is the failure mode - a reduced quiet move that mattered
+//   - the commit is on a branch of its own, so the verification has something to go back to
+// Then tune, one change per measurement, watching the re-search share in the panel: past ~10% the
+// knobs below are too aggressive, near zero means there is room to push. Next knobs, in order:
+// LMR_FIRST_REDUCED to 3, then scaling the reduction by log(depth) * log(move index) instead of
+// the flat 1-or-2 here.
+//
+// TODO the table sizing is stale: 64/128/256 MB were measured on the pre-LMR tree and 256 won.
+// This tree is 9x smaller and fills only 6.5% of it, so most of that table is cold memory pushing
+// the working set out of cache. Re-measure 64 and 128 against the new baseline, and check what
+// DEFAULT_MEGABYTES is actually set to before reading anything into a benchmark.
+
+// a reduced search needs plies left to be worth anything, and the shallow nodes are cheap anyway
+const LMR_MIN_DEPTH: u32 = 3;
+
+// the moves the ordering is confident about, searched in full: the table move, the killers, the captures
+const LMR_FIRST_REDUCED: u32 = 4;
+
+// past here the move is late enough and the node deep enough to give up a second ply
+const LMR_DEEP_DEPTH: u32 = 6;
+const LMR_LATE_MOVE: u32 = 8;
 
 pub struct SearchResult {
     // the deepest pass that finished, which is what best_move and score come from
@@ -100,13 +120,16 @@ pub struct SearchResult {
     pub table_fill: f32,
     // whether the move was read out of the opening book instead of searched for
     pub from_book: bool,
-    // what every pass along the way found, deepening order - the search is only worth
-    // repeating if the passes pay for themselves, and this is where that can be read
+    // what each pass of the deepening found, in order
     pub passes: Vec<DepthPass>,
-    // how many nodes ended on a move that beat beta, and how many of those were cut by
-    // a killer - what says whether remembering the killers is paying for itself
+    // beta cutoffs, and how many of those a killer caused - measures if killers pay for themselves
     pub beta_cutoffs: u64,
     pub killer_cutoffs: u64,
+    // cutoffs where the first move tried was already the one: the share says how good the ordering is
+    pub first_move_cutoffs: u64,
+    // moves searched at reduced depth, and how many of those had to be searched again anyway
+    pub lmr_reductions: u64,
+    pub lmr_researches: u64,
 }
 
 // one pass of the deepening, as it stood when that pass finished
@@ -128,16 +151,15 @@ pub struct Search {
     // the nodes of the search that is running, counted from its root
     positions_searched: u64,
     positions_searched_quiescience: u64,
-    // move lists already allocated, lent to a node and taken back when it is done; the
-    // search is depth first, so no more of them are ever needed than the tree is deep
+    // move lists on loan to a node and returned when it's done; depth first, so never more than the tree is deep
     orders: Vec<MoveOrder>,
-    // the quiet moves that beat beta at each ply, newest first. Two sibling nodes are
-    // the same position but for the one move that separates them, so a quiet move that
-    // refuted one of them usually refutes the next as well - and a quiet move is what
-    // the ordering below has nothing else to say about
+    // quiet moves that beat beta at each ply, newest first - a refutation of one sibling usually refutes the next
     killers: [[Option<Move>; KILLERS_PER_PLY]; MAX_PLY],
     beta_cutoffs: u64,
     killer_cutoffs: u64,
+    first_move_cutoffs: u64,
+    lmr_reductions: u64,
+    lmr_researches: u64,
 }
 
 impl Search {
@@ -151,6 +173,9 @@ impl Search {
             killers: [NO_KILLERS; MAX_PLY],
             beta_cutoffs: 0,
             killer_cutoffs: 0,
+            first_move_cutoffs: 0,
+            lmr_reductions: 0,
+            lmr_researches: 0,
         }
     }
 
@@ -162,14 +187,8 @@ impl Search {
         }
     }
 
-    // the best move for the side to move, searched `depth` plies deep.
-    //
-    // The depth is not gone to in one jump: the position is searched one ply deep,
-    // then two, and so on up to `depth`. Searching the shallow depths over again
-    // sounds like the waste it is not - a pass costs a fraction of the one below it,
-    // and every pass hands the one after it the move it found to try first, which is
-    // where alpha-beta gets its cutoffs from. Ordering the root well is worth more
-    // than the passes cost.
+    // the best move for the side to move, iteratively deepened to `depth` plies - each
+    // shallower pass costs little and hands the next one a move to order first
     pub fn find_best_move(&mut self, board: &mut Board, depth: u32) -> SearchResult {
         // a position the book holds is answered without searching anything at all
         if let Some(opening) = self.book.as_ref().and_then(|book| book.move_for(board)) {
@@ -185,6 +204,9 @@ impl Search {
                 passes: Vec::new(),
                 beta_cutoffs: 0,
                 killer_cutoffs: 0,
+                first_move_cutoffs: 0,
+                lmr_reductions: 0,
+                lmr_researches: 0,
             };
         }
 
@@ -193,9 +215,10 @@ impl Search {
         self.positions_searched_quiescience = 0;
         self.beta_cutoffs = 0;
         self.killer_cutoffs = 0;
-        // the killers are about one position and the plies below it; a move played on
-        // the board moves every ply along, and what refuted a node then refutes nothing
-        // now. Within the one search they are kept, passes of the deepening included
+        self.first_move_cutoffs = 0;
+        self.lmr_reductions = 0;
+        self.lmr_researches = 0;
+        // killers are ply-relative to this search; a move on the board shifts every ply along
         self.killers = [NO_KILLERS; MAX_PLY];
 
         let started = Instant::now();
@@ -204,8 +227,7 @@ impl Search {
         let mut reached = 0;
         let mut passes = Vec::with_capacity(depth as usize);
 
-        // a caller asking for no depth at all wants the position scored where it
-        // stands, which is what quiescence is for - there is nothing to deepen
+        // depth 0 wants the position scored as it stands - quiescence, nothing to deepen
         if depth == 0 {
             score = if board.legal_moves().is_empty() {
                 terminal_score(board, 0)
@@ -228,14 +250,12 @@ impl Search {
                     elapsed: started.elapsed(),
                 });
 
-                // the game is over on the board itself - there is no move to play and
-                // nothing for a deeper pass to look at
+                // the game is over on the board - nothing left for a deeper pass to look at
                 if best_move.is_none() {
                     break;
                 }
 
-                // a mate is proved, not estimated: no deeper pass can find a way out
-                // of one, or a faster one than the shortest this already took
+                // a mate is proved, not estimated - no deeper pass finds a faster one
                 if pass_score.abs() >= MATE_BOUND {
                     break;
                 }
@@ -254,6 +274,9 @@ impl Search {
             passes,
             beta_cutoffs: self.beta_cutoffs,
             killer_cutoffs: self.killer_cutoffs,
+            first_move_cutoffs: self.first_move_cutoffs,
+            lmr_reductions: self.lmr_reductions,
+            lmr_researches: self.lmr_researches,
         }
     }
 
@@ -265,9 +288,8 @@ impl Search {
         }
     }
 
-    // a quiet move that beat beta: remembered for the next node at this ply. A capture
-    // is not worth a slot - the ordering already knows what to do with those - and the
-    // move that is already first would only push itself into the second slot
+    // a quiet move that beat beta, remembered for the next node at this ply - captures
+    // don't need a slot, and a move already first shouldn't push itself into second
     fn remember_killer(&mut self, chess_move: Move, ply: u32) {
         if chess_move.captured.is_some() || chess_move.promotion.is_some() {
             return;
@@ -289,16 +311,13 @@ impl Search {
         self.orders.pop().unwrap_or_else(MoveOrder::new)
     }
 
-    // handed back on every way out of a node, cutoffs included, or the pile runs dry
-    // and the nodes below start allocating again
+    // handed back on every way out of a node, cutoffs included
     fn give_back(&mut self, order: MoveOrder) {
         self.orders.push(order);
     }
 
-    // like alpha_beta with the window wide open, but must return a move. `previous_best`
-    // is what the pass one ply shallower played, which is the best guess there is at
-    // what this one will play - the table usually holds it too, but a collision can
-    // take it out of there, and losing the root move costs the whole pass its ordering
+    // like alpha_beta with the window wide open, but must return a move. `previous_best` is
+    // what the previous pass played - the table usually holds it too, but a collision can lose it
     fn search_root(
         &mut self,
         board: &mut Board,
@@ -319,8 +338,7 @@ impl Search {
         }
 
         let mut best_move = None;
-        // whether best_move repeats a position already on the board this game -
-        // tracked only to break ties, never to prefer a move that scores worse
+        // whether best_move repeats a position already on the board - only breaks ties
         let mut best_repeats = false;
         let mut alpha = -INFINITY;
 
@@ -330,8 +348,7 @@ impl Search {
             let repeats = board.position_repetitions() > 1;
             board.undo_move();
 
-            // among moves the search scores the same, the one that does not repeat
-            // a position already reached this game is the one worth playing
+            // among equally scored moves, prefer the one that doesn't repeat
             let better =
                 best_move.is_none() || score > alpha || (score == alpha && best_repeats && !repeats);
 
@@ -394,20 +411,61 @@ impl Search {
             return 0;
         }
 
-        // until a move beats alpha there is nothing to say about this node but that it
-        // is worth no more than alpha
+        // until a move beats alpha, this node is worth no more than alpha
         let mut node_type = NodeType::UpperBound;
         let mut best_move = None;
+        let mut tried = 0;
+        // asked for at most once a node, and only where a move gets late enough to be reduced
+        let mut in_check = None;
 
         while let Some(chess_move) = order.next() {
+            tried += 1;
+
+            // what the ordering is confident about is searched in full: the early moves, anything
+            // that takes or promotes, the killers, and every move of a node that is under check
+            let late = depth >= LMR_MIN_DEPTH
+                && tried >= LMR_FIRST_REDUCED
+                && chess_move.captured.is_none()
+                && chess_move.promotion.is_none()
+                && !killers.contains(&Some(chess_move))
+                && !*in_check.get_or_insert_with(|| board.is_check(board.turn()));
+
             board.make_move(&chess_move);
-            let score = -self.alpha_beta(board, depth - 1, -beta, -alpha, ply + 1);
+
+            // a move that gives check forces the replies, so its subtree is small enough to keep whole
+            let reduction = if late && !board.is_check(board.turn()) {
+                self.lmr_reductions += 1;
+                if depth >= LMR_DEEP_DEPTH && tried >= LMR_LATE_MOVE {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                0
+            };
+
+            // a reduced move only has to fail low, so it's asked the cheapest question there is
+            let mut score = if reduction > 0 {
+                -self.alpha_beta(board, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1)
+            } else {
+                -self.alpha_beta(board, depth - 1, -beta, -alpha, ply + 1)
+            };
+
+            // it beat alpha anyway, so the guess that it was weak was wrong - search it properly
+            if reduction > 0 && score > alpha {
+                self.lmr_researches += 1;
+                score = -self.alpha_beta(board, depth - 1, -beta, -alpha, ply + 1);
+            }
+
             board.undo_move();
 
             if score >= beta {
                 self.give_back(order);
 
                 self.beta_cutoffs += 1;
+                if tried == 1 {
+                    self.first_move_cutoffs += 1;
+                }
                 if killers.contains(&Some(chess_move)) {
                     self.killer_cutoffs += 1;
                 }
@@ -440,19 +498,16 @@ impl Search {
         alpha
     }
 
-    // captures only, until nothing is hanging, then evaluate; nothing is filed in the
-    // table here, since these scores stop at a quiet position rather than at a depth
+    // captures only, until nothing is hanging, then evaluate; not filed in the table since
+    // these scores stop at a quiet position rather than at a depth
     fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: u32) -> i32 {
         self.positions_searched += 1;
         self.positions_searched_quiescience +=1;
 
-        // no standing pat out of a check, and every evasion counts, not only the captures
+        // no standing pat out of check, and every evasion counts, not only captures
         if board.is_check(board.turn()) {
-            // ordered like any other node: an evasion is as often a quiet block as a
-            // capture, so the killers of this ply are worth asking for. Nothing is
-            // written back into them - the killers are what the full-width search found,
-            // and a line of captures is not the position they were found in. Never
-            // pruned either: drop them all and a mate reads as a score
+            // ordered like any node - an evasion is as often a block as a capture. Never
+            // pruned either: drop a move here and a mate could read as a score
             let killers = self.killers_at(ply);
             let mut order = self.take_order();
             order.load(board, None, killers);
@@ -528,8 +583,7 @@ impl Search {
 // caller stops asking, since most nodes cut off after a move or two
 struct MoveOrder {
     moves: Vec<Move>,
-    // scored in the same order as `moves`, and swapped along with them; an array rather
-    // than a Vec, since this is built fresh at every node
+    // parallel to `moves`, swapped alongside it; a fixed array since this is rebuilt every node
     scores: [i32; MAX_MOVES],
     handed_out: usize,
 }
@@ -544,8 +598,7 @@ impl MoveOrder {
         }
     }
 
-    // scored move list, with the table's move for this position - if it has one - in
-    // front; filled in place, so a reused MoveOrder allocates nothing at all
+    // scored move list with the table's move (if any) in front; filled in place, no allocation
     fn load(
         &mut self,
         board: &Board,
@@ -607,8 +660,7 @@ fn move_score(
     chess_move: &Move,
     killers: [Option<Move>; KILLERS_PER_PLY],
 ) -> i32 {
-    // a killer is a quiet move, so nothing below has anything to say about it: the
-    // material it wins is none, and the square it goes to was already looked at once
+    // a killer is quiet, so nothing below has anything to say about it
     for (slot, killer) in killers.iter().enumerate() {
         if *killer == Some(*chess_move) {
             return KILLER_SCORES[slot];
@@ -650,8 +702,7 @@ fn attacked_by_pawn(board: &Board, square: u8, color: Color) -> bool {
     })
 }
 
-// a node with no legal move left: mate, or a draw by stalemate; a mate is worth a
-// little less the deeper it is, so the search takes the shortest winning line
+// mate or stalemate; a mate is worth a little less the deeper it is, favoring the shortest line
 fn terminal_score(board: &Board, ply: u32) -> i32 {
     if board.is_check(board.turn()) {
         -MATE + ply as i32
@@ -660,8 +711,7 @@ fn terminal_score(board: &Board, ply: u32) -> i32 {
     }
 }
 
-// MVV-LVA: the victim weighs eight times the attacker, so what is taken decides the
-// order and what takes it only breaks ties
+// MVV-LVA: the victim weighs eight times the attacker, so what's taken decides order
 fn capture_score(chess_move: &Move) -> i32 {
     let victim = chess_move
         .captured
@@ -685,8 +735,7 @@ fn optimistic_gain(chess_move: &Move) -> i32 {
     (victim + promotion) as i32
 }
 
-// what delta pruning allows here: nothing once the endgame is reached, where a capture
-// short of alpha today is what a passed pawn is made of tomorrow
+// zero once the endgame is reached, where a capture short of alpha today is tomorrow's passed pawn
 fn delta_margin(board: &Board) -> i32 {
     if game_phase_of(board) <= DELTA_ENDGAME_PHASE {
         0
@@ -755,8 +804,7 @@ fn see(board: &Board, chess_move: &Move) -> i32 {
     gains[0]
 }
 
-// the cheapest piece of `color` that can take on `square`, with what the exchange has
-// already taken off treated as gone
+// the cheapest piece of `color` that can take on `square`; pieces the exchange took off are gone
 fn least_valuable_attacker(
     board: &Board,
     square: u8,

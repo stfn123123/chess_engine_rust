@@ -68,7 +68,7 @@ pub struct TranspositionTable {
 
 impl TranspositionTable {
     // how much memory the table takes unless something asks for another size
-    pub const DEFAULT_MEGABYTES: usize = 64;
+    pub const DEFAULT_MEGABYTES: usize = 256;
 
     pub fn new(megabytes: usize) -> TranspositionTable {
         let slot_size = std::mem::size_of::<Option<Entry>>();
