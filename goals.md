@@ -1,9 +1,34 @@
-- trading pieces leads to the same evaluation, however, when you are down in material it is not good.
+# Evaluation
+
+# Bitboards
+generate_into and evaluate iterate pieces[color][type] now, and the sliders read the
+attack tables in src/board/attacks.rs instead of walking rays square by square. Both
+were measured and improved every number.
+
+Still open: least_valuable_attacker re-walks rays on every SEE call (search.rs).
+
+A bitboard version of it was written and reverted on 2026-09-09. With it in, perft lost
+about 1M nodes/sec and the search 100-200k - but perft never calls SEE, so the SEE code
+itself cannot be what cost that. The suspicion is inlining: attacks::bishop_attacks and
+rook_attacks had one hot caller (sliding_moves) and were almost certainly inlined there
+with the direction folded to a constant; least_valuable_attacker gave them a second hot
+caller, which can flip that decision and slow the movegen path down instead.
+
+attacks.rs has since been given #[inline] on every entry point, and the RUNS_UP lookup
+split into ray_up/ray_down so the bitscan direction is constant where it is compiled.
+That change is NOT measured yet.
+
+Next time: re-measure perft with attacks.rs as it stands now, on its own. If it is at or
+above the post-movegen number, redo the SEE rewrite (the reverted version read the tables
+from the target square and intersected with the piece boards, masking `gone` out of both
+the occupancy and each piece board) and measure again. If perft still sags, the cause is
+binary layout rather than anything in the code, and the SEE rewrite is worth taking for
+its own sake. One more thing left on the table either way: the RAYS index still carries a
+bounds check, because the compiler cannot prove a bitscan result is under 64 - writing it
+as (blockers.trailing_zeros() & 63) makes it provable without unsafe.
+
 
 ## Performance
-- save all pieces positions?
-- piece centric board, no downsides in MY current implementation?
-
 - MoveOrder (search.rs, ~60 lines) could be one line instead: `moves.sort_by_cached_key(|m| -move_score(board, m))`.
 Both score every move once, which is where ~90% of the win over the old sort_unstable_by_key came from. The
 one-liner allocates a Vec per node and orders moves the search never reaches; MoveOrder uses a stack array and
@@ -11,11 +36,18 @@ stops picking when the search stops asking, but is quadratic at nodes where ever
 Expected to be roughly a wash - TEST IT, compare nodes/sec in the info panel.
 Keep MoveOrder only if the incremental interface is wanted for the TT move / killers / staged generation.
 
+# Search
+Search (biggest gaps — you're missing the standard stack)
 
-- psqt inefficient? always have to find all pieces positions at every evaluation?
-- Phase only changes on a capture or a promotion, so it could live on Board and be maintained in set_square, 
-exactly like the zobrist hash and the king squares. That removes the 64-square walk from evaluate entirely.
-Worth doing after the weights change, and it's the same pattern you've already got twice.
+2. no history heuristic.
+   move_score (search.rs:441) scores captures via MVV-LVA and promotions, and everything else 0 minus a pawn-attack penalty. Quiet moves are effectively unordered — and quiet moves are most of the tree. Two killer slots per ply plus a [color][from][to] history table are ~40 lines and typically the second-biggest win after ID.
+
+3. No PVS, no LMR, no null-move pruning, no extensions.
+   Every move gets a full window (search.rs:236). Null-window re-search after the first move (PVS), reducing late quiet moves (LMR), and null-move pruning are what turn depth 8 into depth 12+ at the same node count. Check extensions too — nothing extends anywhere.
+
+4. Fail-hard, and quiescence is uncapped.
+   return beta / storing beta (search.rs:245) throws away information a fail-soft return score would keep for the TT. Separately, the in-check branch of quiescence (search.rs:281) recurses on all legal moves with no ply limit — a perpetual-check position can go arbitrarily deep. Cap it. Quiescence also never probes or stores the TT.
+
 
 ## Gameplay
 - add different time modes and increment
@@ -23,8 +55,3 @@ Worth doing after the weights change, and it's the same pattern you've already g
 
 ## Connect to Lichess
 - using the api
-
-# Performance results
-- PSQT, without saving the king for efficiency, no Quiescience: 2.5M to 2.9M
-- PSQT, WITH saving the king for efficienxy, no Quiescience: up to 3M
-- PSQT, WITH saving the king for efficienxy, WITH Quiescience: early up to 2m, endgame up to 3.5m

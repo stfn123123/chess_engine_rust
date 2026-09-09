@@ -4,12 +4,14 @@
 // stands where, which moves are legal, and how a move is played and taken back.
 //
 // board      - the position, playing a move and taking it back
+// attacks    - the squares a piece attacks, out of a table
 // movegen    - which moves a position allows, and the attack scan
 // piece      - the pieces and the two sides
 // square     - square numbering and the geometry the generators walk
 // castling   - castling rights and the squares castling involves
 // chess_move - a move, and what is needed to undo it
 // zobrist    - the keys the position hash is built from
+
 
 pub mod board;
 pub mod castling;
@@ -18,6 +20,7 @@ pub mod movegen;
 pub mod piece;
 pub mod square;
 pub mod zobrist;
+pub mod attacks;
 
 // the one type the rest of the program works with, so callers write `board::Board`
 // instead of `board::board::Board`

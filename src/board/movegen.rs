@@ -16,6 +16,7 @@
 // through an `Overlay` that describes the board as the move would leave it.
 
 use crate::board::Board;
+use crate::board::attacks;
 use crate::board::castling::{
     CastleSide, king_castle_square, king_start_square, rook_castle_square, rook_start_square,
 };
@@ -25,6 +26,16 @@ use crate::board::square::{
     DIAGONAL_STEPS, KING_STEPS, KNIGHT_STEPS, STRAIGHT_STEPS, bit, direction_between,
     en_passant_captured_square, offset, rank_of, ray, squares_between,
 };
+
+// the king is generated on its own, ahead of the others, so the scan over the pieces
+// leaves it out
+const NON_KING_TYPES: [PieceType; 5] = [
+    PieceType::Pawn,
+    PieceType::Knight,
+    PieceType::Bishop,
+    PieceType::Rook,
+    PieceType::Queen,
+];
 
 impl Board {
     // every legal move of one side, castling included
@@ -74,51 +85,53 @@ impl Board {
             None => u64::MAX,
         };
 
-        // walking the squares once and dispatching on what stands there beats asking
-        // for the squares of all six piece types one after the other
-        for from in 0..64u8 {
-            let Some(piece) = self.piece_at(from) else {
-                continue;
-            };
-            if piece.color() != color || piece.is(PieceType::King) {
-                continue;
-            }
+        // one turn per piece standing rather than one per square, and the type is the
+        // loop's own instead of something to read off the board
+        for piece_type in NON_KING_TYPES {
+            let piece = Piece::new(piece_type, color);
+            let mut pieces = self.piece_board(piece_type, color);
 
-            // a pinned piece is not stuck: it may still move along the line it is
-            // pinned on, up to and including the piece that pins it
-            let allowed = match safety.pin_ray(from) {
-                Some(pin_ray) => answers_check & pin_ray,
-                None => answers_check,
-            };
+            while pieces != 0 {
+                let from = pieces.trailing_zeros() as u8;
+                // takes the lowest bit back off, which is the square just read
+                pieces &= pieces - 1;
 
-            // this piece writes onto the end of the list and the moves it may not play
-            // are taken off again, which saves a second list to sort them out in
-            let start = moves.len();
-            self.moves_for_piece(moves, piece, from);
-
-            let mut kept = start;
-            for index in start..moves.len() {
-                let candidate = moves[index];
-
-                // before the legality scan, which is the expensive half
-                if captures_only && candidate.captured.is_none() {
-                    continue;
-                }
-
-                let legal = if candidate.en_passant {
-                    // the pawn it takes stands beside the square it ends on, so neither
-                    // mask can judge this move - the attack scan has to
-                    self.en_passant_is_legal(&candidate, king_square)
-                } else {
-                    allowed & bit(candidate.to) != 0
+                // a pinned piece is not stuck: it may still move along the line it is
+                // pinned on, up to and including the piece that pins it
+                let allowed = match safety.pin_ray(from) {
+                    Some(pin_ray) => answers_check & pin_ray,
+                    None => answers_check,
                 };
 
-                if legal {
-                    moves[kept] = candidate;
-                    kept += 1;
+                // this piece writes onto the end of the list and the moves it may not
+                // play are taken off again, which saves a second list to sort them out in
+                let start = moves.len();
+                self.moves_for_piece(moves, piece, from);
+
+                let mut kept = start;
+                for index in start..moves.len() {
+                    let candidate = moves[index];
+
+                    // before the legality scan, which is the expensive half
+                    if captures_only && candidate.captured.is_none() {
+                        continue;
+                    }
+
+                    let legal = if candidate.en_passant {
+                        // the pawn it takes stands beside the square it ends on, so
+                        // neither mask can judge this move - the attack scan has to
+                        self.en_passant_is_legal(&candidate, king_square)
+                    } else {
+                        allowed & bit(candidate.to) != 0
+                    };
+
+                    if legal {
+                        moves[kept] = candidate;
+                        kept += 1;
+                    }
                 }
+                moves.truncate(kept);
             }
-            moves.truncate(kept);
         }
 
         // castling out of check is never allowed; castle_moves itself refuses to castle
@@ -147,11 +160,8 @@ impl Board {
     // pseudo-legal moves of a single piece, castling aside; appends rather than allocates
     fn moves_for_piece(&self, moves: &mut Vec<Move>, piece: Piece, from: u8) {
         match piece.piece_type() {
-            PieceType::Bishop => self.sliding_moves(moves, piece, from, &DIAGONAL_STEPS),
-            PieceType::Rook => self.sliding_moves(moves, piece, from, &STRAIGHT_STEPS),
-            PieceType::Queen => {
-                self.sliding_moves(moves, piece, from, &DIAGONAL_STEPS);
-                self.sliding_moves(moves, piece, from, &STRAIGHT_STEPS);
+            PieceType::Bishop | PieceType::Rook | PieceType::Queen => {
+                self.sliding_moves(moves, piece, from)
             }
             PieceType::Knight => self.stepping_moves(moves, piece, from, &KNIGHT_STEPS),
             PieceType::King => self.stepping_moves(moves, piece, from, &KING_STEPS),
@@ -159,22 +169,24 @@ impl Board {
         }
     }
 
-    // walks in each direction until the edge of the board, a friendly piece, or a
-    // capture is hit - bishops, rooks and queens
-    fn sliding_moves(&self, moves: &mut Vec<Move>, piece: Piece, from: u8, steps: &[(i8, i8)]) {
-        for &step in steps {
-            for to in ray(from, step) {
-                match self.piece_at(to) {
-                    None => moves.push(Move::normal(from, to, piece, None)),
-                    Some(occupant) => {
-                        if occupant.color() != piece.color() {
-                            moves.push(Move::normal(from, to, piece, Some(occupant)));
-                        }
-                        // blocked, the rest of this direction is out of reach
-                        break;
-                    }
-                }
-            }
+    // every square the slider reaches, read out of the attack tables and with its own
+    // side's pieces taken back off - bishops, rooks and queens
+    fn sliding_moves(&self, moves: &mut Vec<Move>, piece: Piece, from: u8) {
+        let occupied = self.occupied();
+        let reached = match piece.piece_type() {
+            PieceType::Bishop => attacks::bishop_attacks(from, occupied),
+            PieceType::Rook => attacks::rook_attacks(from, occupied),
+            _ => attacks::queen_attacks(from, occupied),
+        };
+
+        // what the table leaves in is the first piece on each ray, which is only a move
+        // when it belongs to the other side
+        let mut targets = reached & !self.occupied_by(piece.color());
+        while targets != 0 {
+            let to = targets.trailing_zeros() as u8;
+            targets &= targets - 1;
+
+            moves.push(Move::normal(from, to, piece, self.piece_at(to)));
         }
     }
 

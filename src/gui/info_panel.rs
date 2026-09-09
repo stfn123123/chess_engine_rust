@@ -12,7 +12,7 @@ use super::theme::{
     ACCENT, BLACK_SIDE, CALM, DANGER, PANEL_BG, PANEL_BORDER, STAT_EVAL, STAT_SPEED, STAT_TIME,
     TEXT_MUTED, TEXT_PRIMARY, WARNING, WHITE_SIDE,
 };
-use super::{ChessApp, Tone};
+use super::{ChessApp, SearchStats, Tone};
 use crate::board::piece::{Color, PieceType};
 use crate::evaluate::MATE;
 
@@ -229,6 +229,65 @@ fn search_blocks(app: &ChessApp, ui: &mut egui::Ui) {
         &format!("{:.1}%", stats.table_fill * 100.0),
         TEXT_MUTED,
     );
+
+    // what share of the cutoffs came from a quiet move the ply had already seen cut:
+    // the killers are only earning their keep while this stays well clear of zero
+    let killer_share = if stats.beta_cutoffs > 0 {
+        stats.killer_cutoffs as f64 / stats.beta_cutoffs as f64 * 100.0
+    } else {
+        0.0
+    };
+    stat_block(
+        ui,
+        "KILLER CUTOFFS",
+        &format!(
+            "{} ({killer_share:.1}%)",
+            format_count(stats.killer_cutoffs)
+        ),
+        STAT_EVAL,
+    );
+
+    deepening_block(app, ui, stats);
+}
+
+// one row per pass of the deepening: what it played, what it scored it, and what the
+// search had cost by the time it got there. The move should settle on one and stay
+// there, and the node counts show whether the passes are paying for themselves
+fn deepening_block(app: &ChessApp, ui: &mut egui::Ui, stats: &SearchStats) {
+    if stats.passes.is_empty() {
+        return;
+    }
+
+    label(ui, "DEEPENING");
+    ui.add_space(4.0);
+
+    // the pass before, so the node count can be read as this pass on its own as well
+    let mut before = 0;
+
+    for pass in &stats.passes {
+        let best_move = match &pass.best_move {
+            Some(chess_move) => chess_move.coordinates(),
+            None => "-".to_string(),
+        };
+
+        let row = format!(
+            "d{:<2} {:<6} {:>8} {:>10} {:>10}",
+            pass.depth,
+            best_move,
+            format_score(app.white_view(pass.score)),
+            format_count(pass.positions_searched - before),
+            format_duration(pass.elapsed),
+        );
+        before = pass.positions_searched;
+
+        ui.label(
+            egui::RichText::new(row)
+                .font(egui::FontId::monospace(12.0))
+                .color(TEXT_PRIMARY),
+        );
+    }
+
+    ui.add_space(18.0);
 }
 
 // turning the engine off and on, running it by hand, and the positions put aside to
@@ -559,6 +618,19 @@ fn bitboard_blocks(app: &mut ChessApp, ui: &mut egui::Ui) {
     let full_width = ui.available_width();
     if panel_button(ui, "Clear All", TEXT_MUTED, egui::vec2(full_width, 30.0)) {
         app.shown_bitboards = [[false; 6]; 2];
+    }
+
+    // the attack tables answering for one piece, which is how they are checked by eye:
+    // click a piece and the squares it covers get a ring, blockers and all
+    ui.add_space(8.0);
+    let text_color = if app.show_attacks { CALM } else { TEXT_MUTED };
+    if panel_button(
+        ui,
+        "Attacks of Selected",
+        text_color,
+        egui::vec2(full_width, 30.0),
+    ) {
+        app.show_attacks = !app.show_attacks;
     }
 }
 

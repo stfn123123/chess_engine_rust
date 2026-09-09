@@ -18,10 +18,7 @@
 // entry, which is what tells a hit apart from a position that merely landed here too.
 
 use crate::board::chess_move::Move;
-use crate::evaluate::MATE;
-
-// a score at least this far up is a mate rather than a count of material
-const MATE_BOUND: i32 = MATE - 1_000;
+use crate::evaluate::{MATE, MATE_BOUND};
 
 // what a stored score says about the position
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -21,6 +21,7 @@ use crate::board::chess_move::Move;
 use crate::board::piece::{Color, PieceType};
 use crate::evaluate::{evaluate, game_phase_of};
 use crate::search;
+use crate::search::DepthPass;
 
 // the panel is a fixed width, wide enough for its two columns, the board gets the rest
 const PANEL_WIDTH: f32 = 480.0;
@@ -33,6 +34,7 @@ const AUTOPLAY_DELAY: Duration = Duration::from_millis(800);
 
 // what the last search found, and what it cost, as shown in the side panel
 struct SearchStats {
+    // the deepest pass of the deepening that finished
     depth: u32,
     // the move the search would play here, None once the game is over
     best_move: Option<Move>,
@@ -48,6 +50,12 @@ struct SearchStats {
     // whether the move came out of the opening book rather than out of a search
     from_book: bool,
     duration: Duration,
+    // one entry per pass of the deepening, shallowest first
+    passes: Vec<DepthPass>,
+    // how many nodes were cut short by a move that beat beta, and how many of those the
+    // killers of that ply supplied - the share is what says the killers are working
+    beta_cutoffs: u64,
+    killer_cutoffs: u64,
 }
 
 // what a position count found, and what it cost
@@ -137,6 +145,8 @@ pub struct ChessApp {
     // which of the board's bitboards are painted over the position, indexed as they are -
     // a way to watch one through a promotion, an en passant or a castle
     shown_bitboards: [[bool; 6]; 2],
+    // whether the attack table's answer for the selected piece is drawn over the board
+    show_attacks: bool,
 }
 
 impl ChessApp {
@@ -184,6 +194,7 @@ impl ChessApp {
             saved_games,
             replay: None,
             shown_bitboards: [[false; 6]; 2],
+            show_attacks: false,
         };
         app.position_changed();
         app
@@ -194,6 +205,7 @@ impl ChessApp {
         let saved_games = std::mem::take(&mut self.saved_games);
         // belongs to the session rather than to the game, like the toggles above it
         let shown_bitboards = self.shown_bitboards;
+        let show_attacks = self.show_attacks;
         *self = ChessApp::with_state(
             self.settings,
             self.analysis_enabled,
@@ -203,6 +215,7 @@ impl ChessApp {
             saved_games,
         );
         self.shown_bitboards = shown_bitboards;
+        self.show_attacks = show_attacks;
     }
 
     // the game has ended, so no more moves are taken
@@ -392,7 +405,9 @@ impl ChessApp {
         let duration = start.elapsed();
 
         self.last_search = Some(SearchStats {
-            depth,
+            // what the search reached, which is not the depth asked for when a mate
+            // was proved on the way up and the passes after it were dropped
+            depth: result.depth,
             best_move: result.best_move,
             score: self.white_view(result.score),
             positions_searched: result.positions_searched,
@@ -401,6 +416,9 @@ impl ChessApp {
             table_fill: result.table_fill,
             from_book: result.from_book,
             duration,
+            passes: result.passes,
+            beta_cutoffs: result.beta_cutoffs,
+            killer_cutoffs: result.killer_cutoffs,
         });
     }
 

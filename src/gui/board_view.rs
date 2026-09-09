@@ -4,15 +4,18 @@ use eframe::egui;
 
 use super::ChessApp;
 use super::theme::{
-    BB_BISHOP, BB_BLACK_EDGE, BB_KING, BB_KNIGHT, BB_PAWN, BB_QUEEN, BB_ROOK, DARK_SQUARE,
-    LEGAL_TARGET_DOT, LIGHT_SQUARE, SELECTED_OUTLINE,
+    ATTACK_RING, BB_BISHOP, BB_BLACK_EDGE, BB_KING, BB_KNIGHT, BB_PAWN, BB_QUEEN, BB_ROOK,
+    DARK_SQUARE, LEGAL_TARGET_DOT, LIGHT_SQUARE, SELECTED_OUTLINE,
 };
+use crate::board::attacks;
 use crate::board::piece::{Color, Piece, PieceType};
 use crate::board::square::bit;
 
 // draws the eight by eight grid, with rank 1 at the bottom, and forwards clicks
 pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, board_size: f32) {
     let cell = board_size / 8.0;
+    // worked out once for the frame rather than per square
+    let attacked = attack_overlay(app);
 
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(board_size, board_size), egui::Sense::hover());
@@ -60,6 +63,17 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, board_size: f32) {
                 }
             }
 
+            // what the attack table says the selected piece covers, whether or not a
+            // move there is legal - this is the table itself, not the move generator
+            if attacked & bit(square) != 0 {
+                ui.painter().rect_stroke(
+                    cell_rect.shrink(cell * 0.12),
+                    cell * 0.1,
+                    egui::Stroke::new(cell * 0.06, ATTACK_RING),
+                    egui::StrokeKind::Inside,
+                );
+            }
+
             if app.selected == Some(square) {
                 ui.painter().rect_stroke(
                     cell_rect,
@@ -78,6 +92,33 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, board_size: f32) {
                 app.handle_click(square);
             }
         }
+    }
+}
+
+// the squares the piece on the selected square attacks, straight out of the tables, so
+// they can be checked by eye before anything in the engine is rewritten against them.
+// Empty unless the overlay is switched on and a square with a piece on it is selected
+fn attack_overlay(app: &ChessApp) -> u64 {
+    if !app.show_attacks {
+        return 0;
+    }
+
+    let Some(square) = app.selected else {
+        return 0;
+    };
+    let Some(piece) = app.board.piece_at(square) else {
+        return 0;
+    };
+
+    let occupied = app.board.occupied_by(Color::White) | app.board.occupied_by(Color::Black);
+
+    match piece.piece_type() {
+        PieceType::King => attacks::king_attacks(square),
+        PieceType::Pawn => attacks::pawn_attacks(square, piece.color()),
+        PieceType::Knight => attacks::knight_attacks(square),
+        PieceType::Bishop => attacks::bishop_attacks(square, occupied),
+        PieceType::Rook => attacks::rook_attacks(square, occupied),
+        PieceType::Queen => attacks::queen_attacks(square, occupied),
     }
 }
 

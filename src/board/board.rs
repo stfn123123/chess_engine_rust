@@ -13,34 +13,15 @@ use crate::board::zobrist::ZOBRIST;
 pub struct Board {
     turn: Color,
     squares: [Option<Piece>; 64],
-    // the same pieces the other way round, indexed [Color::index][PieceType::board_index]:
-    // the mailbox says what stands here, these say where a piece type stands
     pieces: [[u64; 6]; 2],
-    // the six boards of a side or-ed together, kept rather than worked out on demand
     occupied: [u64; 2],
-    // where each king stands, indexed by Color::index - kept here because the move
-    // generator asks for it several times per position
-    king_squares: [Option<u8>; 2],
-    // every move played so far, together with what is needed to take it back
     history: Vec<MoveRecord>,
-    // the key of every position a move was played in, oldest first - the same order as
-    // `history`, kept apart from it so the repetition scan walks nothing but keys
     position_keys: Vec<u64>,
-    // plies since the last capture or pawn move: the 50-move counter, and also how far
-    // back a repetition could possibly reach
     halfmove_clock: u16,
     castling_rights: CastlingRights,
-    // the square a pawn skipped over with its double push, i.e. the square an enemy
-    // pawn may capture onto right now - only valid for the immediately following move
     en_passant_target: Option<u8>,
-    // the zobrist hash of the current position: pieces, side to move, castling rights
-    // and the en passant option, kept up to date move by move instead of recomputed
     hash: u64,
-    // the en passant key that is currently mixed into `hash`, 0 when there is none
-    // remembered because whether a target is capturable can change with the position
     en_passant_hash: u64,
-    // the phase weights of everything standing, added up - kept here because only a
-    // capture or a promotion can change it
     phase: i32,
 }
 
@@ -54,7 +35,6 @@ impl Board {
             squares: [None; 64],
             pieces: [[0; 6]; 2],
             occupied: [0; 2],
-            king_squares: [None; 2],
             history: Vec::new(),
             position_keys: Vec::new(),
             halfmove_clock: 0,
@@ -125,9 +105,12 @@ impl Board {
         self.squares[square as usize]
     }
 
-    // where the king of that side stands - None only on a hand built board
+    // where the king of that side stands - None only on a hand built board. Read out of
+    // the king's own bitboard, which is the one place the position is kept: a board with
+    // a single bit set is a square as soon as that bit is asked for
     pub(crate) fn king_square(&self, color: Color) -> Option<u8> {
-        self.king_squares[color.index()]
+        let kings = self.pieces[color.index()][PieceType::King.board_index()];
+        (kings != 0).then(|| kings.trailing_zeros() as u8)
     }
 
     // the raw count, so a promotion can push it past a full board
@@ -140,11 +123,15 @@ impl Board {
         self.pieces[color.index()][piece_type.board_index()]
     }
 
-    // every square that side has a piece on - nothing reads it yet, it is what the
-    // move generator and the attack scan will be rewritten against
-    #[allow(dead_code)]
+    // every square that side has a piece on - the two of them together are the occupancy
+    // the sliding attack tables are read with
     pub fn occupied_by(&self, color: Color) -> u64 {
         self.occupied[color.index()]
+    }
+
+    // every square holding anything at all, which is what a slider is stopped by
+    pub fn occupied(&self) -> u64 {
+        self.occupied[0] | self.occupied[1]
     }
 
     // every square holding a piece of that type and color
@@ -257,11 +244,6 @@ impl Board {
         self.set_en_passant_target(target);
 
         debug_assert_eq!(self.hash, self.full_hash(), "incremental hash drifted");
-        debug_assert_eq!(
-            self.king_squares,
-            self.searched_king_squares(),
-            "king squares drifted"
-        );
         debug_assert_eq!(self.phase, self.counted_phase(), "phase drifted");
         debug_assert_eq!(self.pieces, self.counted_pieces(), "bitboards drifted");
         debug_assert_eq!(self.occupied, self.counted_occupied(), "occupancy drifted");
@@ -318,11 +300,6 @@ impl Board {
         self.set_en_passant_target(record.en_passant_before);
 
         debug_assert_eq!(self.hash, self.full_hash(), "incremental hash drifted");
-        debug_assert_eq!(
-            self.king_squares,
-            self.searched_king_squares(),
-            "king squares drifted"
-        );
         debug_assert_eq!(self.phase, self.counted_phase(), "phase drifted");
         debug_assert_eq!(self.pieces, self.counted_pieces(), "bitboards drifted");
         debug_assert_eq!(self.occupied, self.counted_occupied(), "occupancy drifted");
@@ -543,9 +520,9 @@ pub fn insufficient_minors(bishops: [usize; 2], knights: [usize; 2]) -> bool {
 
 // -------------------- keeping the hash in sync --------------------
 impl Board {
-    // every write to a square goes through here, so the hash, the king squares, the
-    // phase and the bitboards stay in sync - xor is its own inverse, so taking off and
-    // putting on are one
+    // every write to a square goes through here, so the hash, the phase and the
+    // bitboards stay in sync - xor is its own inverse, so taking off and putting on
+    // are one, and the order two writes come in cannot matter
     fn set_square(&mut self, square: u8, piece: Option<Piece>) {
         if let Some(previous) = self.squares[square as usize] {
             self.hash ^= ZOBRIST.piece(square, previous);
@@ -557,14 +534,6 @@ impl Board {
             self.pieces[previous.color().index()][previous.piece_type().board_index()] ^=
                 bit(square);
             self.occupied[previous.color().index()] ^= bit(square);
-
-            // only clear when this is still the recorded square: a move writes the king
-            // onto `to` before clearing `from`, and that write already moved the record
-            if previous.is(PieceType::King)
-                && self.king_squares[previous.color().index()] == Some(square)
-            {
-                self.king_squares[previous.color().index()] = None;
-            }
         }
         if let Some(piece) = piece {
             self.hash ^= ZOBRIST.piece(square, piece);
@@ -572,10 +541,6 @@ impl Board {
 
             self.pieces[piece.color().index()][piece.piece_type().board_index()] ^= bit(square);
             self.occupied[piece.color().index()] ^= bit(square);
-
-            if piece.is(PieceType::King) {
-                self.king_squares[piece.color().index()] = Some(square);
-            }
         }
 
         self.squares[square as usize] = piece;
@@ -619,11 +584,6 @@ impl Board {
         });
 
         if can_capture { Some(target) } else { None }
-    }
-
-    // the king squares searched for from scratch, for the debug_asserts to check
-    fn searched_king_squares(&self) -> [Option<u8>; 2] {
-        Color::BOTH.map(|color| self.squares_with(PieceType::King, color).next())
     }
 
     // the halfmove clock counted from scratch, for the debug_asserts to check against

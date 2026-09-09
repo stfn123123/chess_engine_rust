@@ -12,7 +12,11 @@
 // out - it only saves work.
 //
 // How early the cutoff comes is down to the order the moves are tried in, which is
-// what MoveOrder is for: it guesses at the good ones and hands them out first.
+// what MoveOrder is for: it guesses at the good ones and hands them out first. What
+// it has to go on is mostly the material a move wins, which says nothing at all about
+// a quiet move - so the quiet moves that did cut a node off are remembered per ply and
+// tried early at the next node of that ply. Sibling nodes differ by one move, and a
+// refutation of one is usually a refutation of the next: those are the killers.
 //
 // The same position is reached over and over by different move orders, so a search
 // that remembers what it found is spared searching it again: the transposition table
@@ -38,12 +42,13 @@ use crate::board::square::{
     DIAGONAL_STEPS, KING_STEPS, KNIGHT_STEPS, STRAIGHT_STEPS, en_passant_captured_square, offset,
     ray,
 };
-use crate::evaluate::{MATE, evaluate, game_phase_of, piece_value};
+use crate::evaluate::{MATE, MATE_BOUND, evaluate, game_phase_of, piece_value};
 use crate::opening::OpeningBook;
 use crate::transposition::{NodeType, TranspositionTable};
+use std::time::{Duration, Instant};
 
 // how deep the search runs unless something asks for another depth
-pub const DEFAULT_DEPTH: u32 = 8;
+pub const DEFAULT_DEPTH: u32 = 10;
 
 const INFINITY: i32 = 1_000_000;
 
@@ -62,11 +67,28 @@ const DELTA_ENDGAME_PHASE: f32 = 0.25;
 // the move the table kept, put ahead of anything the guesswork below can score
 const TABLE_MOVE_SCORE: i32 = 1_000_000;
 
+// how deep the killers are kept for. Quiescence carries the ply count past the depth
+// the search was asked for, so this is a bound on the whole tree, not on the depth
+const MAX_PLY: usize = 128;
+
+// how many quiet moves are remembered per ply. Two is what the idea is worth: the
+// first is nearly always the one that cuts again, and a third crowds out the captures
+const KILLERS_PER_PLY: usize = 2;
+
+// where a killer is handed out: after every capture, the cheapest of which is a queen
+// taking a pawn at 100, and before every ordinary quiet move, which scores 0 or less.
+// The second killer is the older one, so it goes behind the first
+const KILLER_SCORES: [i32; KILLERS_PER_PLY] = [99, 98];
+
+// a node that has no killers to offer - the root, and everything quiescence looks at
+const NO_KILLERS: [Option<Move>; KILLERS_PER_PLY] = [None; KILLERS_PER_PLY];
+
 // what the king is worth to an exchange: it can never be taken, so it has to outweigh
 // anything winning it could bring in
 const SEE_KING_VALUE: i32 = 10_000;
 
 pub struct SearchResult {
+    // the deepest pass that finished, which is what best_move and score come from
     pub depth: u32,
     pub best_move: Option<Move>,
     pub score: i32,
@@ -78,6 +100,24 @@ pub struct SearchResult {
     pub table_fill: f32,
     // whether the move was read out of the opening book instead of searched for
     pub from_book: bool,
+    // what every pass along the way found, deepening order - the search is only worth
+    // repeating if the passes pay for themselves, and this is where that can be read
+    pub passes: Vec<DepthPass>,
+    // how many nodes ended on a move that beat beta, and how many of those were cut by
+    // a killer - what says whether remembering the killers is paying for itself
+    pub beta_cutoffs: u64,
+    pub killer_cutoffs: u64,
+}
+
+// one pass of the deepening, as it stood when that pass finished
+pub struct DepthPass {
+    pub depth: u32,
+    pub best_move: Option<Move>,
+    pub score: i32,
+    // every node of the search so far, this pass and all the shallower ones before it
+    pub positions_searched: u64,
+    // measured the same way: from the start of the search, not of this pass
+    pub elapsed: Duration,
 }
 
 // the opening book and transposition table, which outlive a single search
@@ -91,6 +131,13 @@ pub struct Search {
     // move lists already allocated, lent to a node and taken back when it is done; the
     // search is depth first, so no more of them are ever needed than the tree is deep
     orders: Vec<MoveOrder>,
+    // the quiet moves that beat beta at each ply, newest first. Two sibling nodes are
+    // the same position but for the one move that separates them, so a quiet move that
+    // refuted one of them usually refutes the next as well - and a quiet move is what
+    // the ordering below has nothing else to say about
+    killers: [[Option<Move>; KILLERS_PER_PLY]; MAX_PLY],
+    beta_cutoffs: u64,
+    killer_cutoffs: u64,
 }
 
 impl Search {
@@ -101,6 +148,9 @@ impl Search {
             positions_searched: 0,
             positions_searched_quiescience: 0,
             orders: Vec::new(),
+            killers: [NO_KILLERS; MAX_PLY],
+            beta_cutoffs: 0,
+            killer_cutoffs: 0,
         }
     }
 
@@ -112,7 +162,14 @@ impl Search {
         }
     }
 
-    // the best move for the side to move, searched `depth` plies deep
+    // the best move for the side to move, searched `depth` plies deep.
+    //
+    // The depth is not gone to in one jump: the position is searched one ply deep,
+    // then two, and so on up to `depth`. Searching the shallow depths over again
+    // sounds like the waste it is not - a pass costs a fraction of the one below it,
+    // and every pass hands the one after it the move it found to try first, which is
+    // where alpha-beta gets its cutoffs from. Ordering the root well is worth more
+    // than the passes cost.
     pub fn find_best_move(&mut self, board: &mut Board, depth: u32) -> SearchResult {
         // a position the book holds is answered without searching anything at all
         if let Some(opening) = self.book.as_ref().and_then(|book| book.move_for(board)) {
@@ -125,17 +182,68 @@ impl Search {
                 table_cutoffs: 0,
                 table_fill: self.table.fill(),
                 from_book: true,
+                passes: Vec::new(),
+                beta_cutoffs: 0,
+                killer_cutoffs: 0,
             };
         }
 
         self.table.start_search();
         self.positions_searched = 1;
         self.positions_searched_quiescience = 0;
+        self.beta_cutoffs = 0;
+        self.killer_cutoffs = 0;
+        // the killers are about one position and the plies below it; a move played on
+        // the board moves every ply along, and what refuted a node then refutes nothing
+        // now. Within the one search they are kept, passes of the deepening included
+        self.killers = [NO_KILLERS; MAX_PLY];
 
-        let (best_move, score) = self.search_root(board, depth);
+        let started = Instant::now();
+        let mut best_move = None;
+        let mut score = 0;
+        let mut reached = 0;
+        let mut passes = Vec::with_capacity(depth as usize);
+
+        // a caller asking for no depth at all wants the position scored where it
+        // stands, which is what quiescence is for - there is nothing to deepen
+        if depth == 0 {
+            score = if board.legal_moves().is_empty() {
+                terminal_score(board, 0)
+            } else {
+                self.quiescence(board, -INFINITY, INFINITY, 0)
+            };
+        } else {
+            for current in 1..=depth {
+                let (pass_move, pass_score) = self.search_root(board, current, best_move);
+
+                best_move = pass_move;
+                score = pass_score;
+                reached = current;
+
+                passes.push(DepthPass {
+                    depth: current,
+                    best_move,
+                    score: pass_score,
+                    positions_searched: self.positions_searched,
+                    elapsed: started.elapsed(),
+                });
+
+                // the game is over on the board itself - there is no move to play and
+                // nothing for a deeper pass to look at
+                if best_move.is_none() {
+                    break;
+                }
+
+                // a mate is proved, not estimated: no deeper pass can find a way out
+                // of one, or a faster one than the shortest this already took
+                if pass_score.abs() >= MATE_BOUND {
+                    break;
+                }
+            }
+        }
 
         SearchResult {
-            depth,
+            depth: reached,
             best_move,
             score,
             positions_searched: self.positions_searched,
@@ -143,7 +251,37 @@ impl Search {
             table_cutoffs: self.table.cutoffs(),
             table_fill: self.table.fill(),
             from_book: false,
+            passes,
+            beta_cutoffs: self.beta_cutoffs,
+            killer_cutoffs: self.killer_cutoffs,
         }
+    }
+
+    // the killers of a ply, or none at all past the depth they are kept for
+    fn killers_at(&self, ply: u32) -> [Option<Move>; KILLERS_PER_PLY] {
+        match self.killers.get(ply as usize) {
+            Some(killers) => *killers,
+            None => NO_KILLERS,
+        }
+    }
+
+    // a quiet move that beat beta: remembered for the next node at this ply. A capture
+    // is not worth a slot - the ordering already knows what to do with those - and the
+    // move that is already first would only push itself into the second slot
+    fn remember_killer(&mut self, chess_move: Move, ply: u32) {
+        if chess_move.captured.is_some() || chess_move.promotion.is_some() {
+            return;
+        }
+
+        let Some(killers) = self.killers.get_mut(ply as usize) else {
+            return;
+        };
+        if killers[0] == Some(chess_move) {
+            return;
+        }
+
+        killers[1] = killers[0];
+        killers[0] = Some(chess_move);
     }
 
     // a move list to work in, the one the last node finished with where there is one
@@ -157,23 +295,27 @@ impl Search {
         self.orders.push(order);
     }
 
-    // like alpha_beta with the window wide open, but must return a move
-    fn search_root(&mut self, board: &mut Board, depth: u32) -> (Option<Move>, i32) {
-        // usually still the answer to what the opponent just did
-        let table_move = self.table.best_move(board.hash());
+    // like alpha_beta with the window wide open, but must return a move. `previous_best`
+    // is what the pass one ply shallower played, which is the best guess there is at
+    // what this one will play - the table usually holds it too, but a collision can
+    // take it out of there, and losing the root move costs the whole pass its ordering
+    fn search_root(
+        &mut self,
+        board: &mut Board,
+        depth: u32,
+        previous_best: Option<Move>,
+    ) -> (Option<Move>, i32) {
+        // failing that, still usually the answer to what the opponent just did
+        let table_move = previous_best.or_else(|| self.table.best_move(board.hash()));
 
         let mut order = self.take_order();
-        order.load(board, table_move);
+        // the root has no killers: nothing above it ever cut off, so nothing was stored
+        order.load(board, table_move, NO_KILLERS);
 
-        // nothing to search: the game is over, or the caller asked for no depth at all
+        // nothing to search: the game is over
         if order.moves.is_empty() {
             self.give_back(order);
             return (None, terminal_score(board, 0));
-        }
-
-        if depth == 0 {
-            self.give_back(order);
-            return (None, self.quiescence(board, -INFINITY, INFINITY, 0));
         }
 
         let mut best_move = None;
@@ -237,8 +379,9 @@ impl Search {
         }
 
         // the move list is in hand here, so whether the game ended costs nothing to ask
+        let killers = self.killers_at(ply);
         let mut order = self.take_order();
-        order.load(board, probe.best_move);
+        order.load(board, probe.best_move, killers);
 
         if order.moves.is_empty() {
             self.give_back(order);
@@ -263,6 +406,12 @@ impl Search {
 
             if score >= beta {
                 self.give_back(order);
+
+                self.beta_cutoffs += 1;
+                if killers.contains(&Some(chess_move)) {
+                    self.killer_cutoffs += 1;
+                }
+                self.remember_killer(chess_move, ply);
 
                 // beta is only a floor here, and this is the move to try first next time
                 self.table.store(
@@ -300,9 +449,13 @@ impl Search {
         // no standing pat out of a check, and every evasion counts, not only the captures
         if board.is_check(board.turn()) {
             // ordered like any other node: an evasion is as often a quiet block as a
-            // capture. Never pruned - drop them all and a mate reads as a score
+            // capture, so the killers of this ply are worth asking for. Nothing is
+            // written back into them - the killers are what the full-width search found,
+            // and a line of captures is not the position they were found in. Never
+            // pruned either: drop them all and a mate reads as a score
+            let killers = self.killers_at(ply);
             let mut order = self.take_order();
-            order.load(board, None);
+            order.load(board, None, killers);
 
             if order.moves.is_empty() {
                 self.give_back(order);
@@ -393,14 +546,19 @@ impl MoveOrder {
 
     // scored move list, with the table's move for this position - if it has one - in
     // front; filled in place, so a reused MoveOrder allocates nothing at all
-    fn load(&mut self, board: &Board, table_move: Option<Move>) {
+    fn load(
+        &mut self,
+        board: &Board,
+        table_move: Option<Move>,
+        killers: [Option<Move>; KILLERS_PER_PLY],
+    ) {
         board.legal_moves_into(&mut self.moves);
 
         for (index, chess_move) in self.moves.iter().enumerate() {
             self.scores[index] = if Some(*chess_move) == table_move {
                 TABLE_MOVE_SCORE
             } else {
-                move_score(board, chess_move)
+                move_score(board, chess_move, killers)
             };
         }
 
@@ -444,7 +602,19 @@ impl Iterator for MoveOrder {
 }
 
 // what a move looks worth without playing it, in centipawns
-fn move_score(board: &Board, chess_move: &Move) -> i32 {
+fn move_score(
+    board: &Board,
+    chess_move: &Move,
+    killers: [Option<Move>; KILLERS_PER_PLY],
+) -> i32 {
+    // a killer is a quiet move, so nothing below has anything to say about it: the
+    // material it wins is none, and the square it goes to was already looked at once
+    for (slot, killer) in killers.iter().enumerate() {
+        if *killer == Some(*chess_move) {
+            return KILLER_SCORES[slot];
+        }
+    }
+
     let mut score = 0;
     let moved = chess_move.piece.piece_type();
 
@@ -907,6 +1077,62 @@ mod tests {
         assert_eq!(result.score, MATE - 1, "the mate was not seen at the leaf");
     }
 
+    // the depth asked for is arrived at one ply at a time, and every pass is on record
+    #[test]
+    fn the_search_deepens_one_ply_at_a_time() {
+        let mut board = start_position();
+
+        let result = find_best_move(&mut board, 4);
+
+        assert_eq!(result.depth, 4);
+        assert_eq!(result.passes.len(), 4);
+
+        let mut nodes = 0;
+        for (index, pass) in result.passes.iter().enumerate() {
+            assert_eq!(pass.depth, index as u32 + 1, "the passes skipped a depth");
+            assert!(pass.best_move.is_some(), "a pass came back with no move");
+            // the count is the whole search so far, so it only ever grows
+            assert!(pass.positions_searched >= nodes, "at depth {}", pass.depth);
+            nodes = pass.positions_searched;
+        }
+
+        // and what the last pass found is what the search as a whole answers
+        let last = result.passes.last().expect("four passes");
+        assert_eq!(last.best_move, result.best_move);
+        assert_eq!(last.score, result.score);
+        assert_eq!(nodes, result.positions_searched);
+    }
+
+    // a mate is proved rather than estimated, so the passes after it have nothing left
+    // to find - the search stops short of the depth it was asked for
+    #[test]
+    fn a_proved_mate_stops_the_deepening() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 63); // h8
+        board.add_piece(Piece::new(PieceType::Rook, Color::White), 48); // a7
+        board.add_piece(Piece::new(PieceType::Rook, Color::White), 1); // b1
+
+        let result = find_best_move(&mut board, 5);
+
+        assert_eq!(result.score, MATE - 1);
+        assert_eq!(result.depth, 1, "the deepening carried on past a mate in one");
+        assert_eq!(result.passes.len(), 1);
+    }
+
+    // deepening changes the order the work is done in, not the answer that comes out
+    #[test]
+    fn deepening_scores_a_position_as_a_single_pass_does() {
+        let mut board = queen_against_pawns();
+
+        for depth in 1..=4 {
+            let deepened = find_best_move(&mut board, depth);
+            let (_, single) = search().search_root(&mut board, depth, None);
+
+            assert_eq!(deepened.score, single, "at depth {depth}");
+        }
+    }
+
     // a queen standing there for nothing gets taken
     #[test]
     fn a_hanging_queen_is_taken() {
@@ -940,7 +1166,7 @@ mod tests {
         board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 41); // b6
 
         let mut order = MoveOrder::new();
-        order.load(&board, None);
+        order.load(&board, None, NO_KILLERS);
         let ordered: Vec<Move> = order.collect();
 
         let first = ordered.first().expect("white has moves");
@@ -957,7 +1183,7 @@ mod tests {
         let moves = board.legal_moves();
 
         let mut order = MoveOrder::new();
-        order.load(&board, None);
+        order.load(&board, None, NO_KILLERS);
         let ordered: Vec<Move> = order.collect();
 
         assert_eq!(ordered.len(), moves.len(), "the move list changed length");
@@ -971,7 +1197,7 @@ mod tests {
 
         let scores: Vec<i32> = ordered
             .iter()
-            .map(|chess_move| move_score(&board, chess_move))
+            .map(|chess_move| move_score(&board, chess_move, NO_KILLERS))
             .collect();
         assert!(
             scores.windows(2).all(|pair| pair[0] >= pair[1]),
@@ -1174,10 +1400,60 @@ mod tests {
             .expect("Nb1c3 is legal");
 
         let mut order = MoveOrder::new();
-        order.load(&board, Some(table_move));
+        order.load(&board, Some(table_move), NO_KILLERS);
         let ordered: Vec<Move> = order.collect();
 
         assert_eq!(ordered[0], table_move, "the stored move was not searched first");
+    }
+
+    // a killer goes ahead of the quiet moves it is one of, and stays behind the captures
+    #[test]
+    fn a_killer_is_handed_out_after_the_captures_and_before_the_quiet_moves() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 4); // e1
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 63); // h8
+        board.add_piece(Piece::new(PieceType::Rook, Color::White), 0); // a1
+        board.add_piece(Piece::new(PieceType::Queen, Color::Black), 56); // a8
+        board.add_piece(Piece::new(PieceType::Knight, Color::White), 6); // g1
+
+        // Ng1f3, which nothing about the position itself recommends
+        let moves = board.legal_moves();
+        let killer = *moves
+            .iter()
+            .find(|chess_move| (chess_move.from, chess_move.to) == (6, 21))
+            .expect("Ng1f3 is legal");
+
+        let mut order = MoveOrder::new();
+        order.load(&board, None, [Some(killer), None]);
+        let ordered: Vec<Move> = order.collect();
+
+        // Rxa8 takes a queen, so it still leads
+        let first = ordered.first().expect("white has moves");
+        assert_eq!((first.from, first.to), (0, 56), "the capture lost its place");
+        assert_eq!(ordered[1], killer, "the killer was not second");
+    }
+
+    // the killers are of the ply, so what one node found is there for the next one
+    #[test]
+    fn a_quiet_move_that_beats_beta_is_kept_as_a_killer() {
+        let mut engine = search();
+        let mut board = start_position();
+
+        engine.find_best_move(&mut board, 4);
+
+        let kept: usize = engine
+            .killers
+            .iter()
+            .flatten()
+            .filter(|killer| killer.is_some())
+            .count();
+
+        assert!(kept > 0, "no quiet cutoff was remembered in a whole search");
+        // a killer is a quiet move: a capture is ordered by what it takes instead
+        for killer in engine.killers.iter().flatten().flatten() {
+            assert!(killer.captured.is_none(), "{killer:?} takes something");
+            assert!(killer.promotion.is_none(), "{killer:?} promotes");
+        }
     }
 
     // the opening is looked up, not searched: no position is walked at all

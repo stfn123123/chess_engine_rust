@@ -36,6 +36,10 @@ pub const BB_QUEEN: egui::Color32 = egui::Color32::from_rgba_premultiplied(99, 4
 // the two sides share the colours above, so the black boards get an inset edge
 pub const BB_BLACK_EDGE: egui::Color32 = egui::Color32::from_rgb(22, 20, 18);
 
+// the attack table's answer for the selected piece, painted as a ring rather than a
+// tint so it reads on top of any of the boards above
+pub const ATTACK_RING: egui::Color32 = egui::Color32::from_rgba_premultiplied(196, 74, 62, 170);
+
 // one colour per search number, so the panel can be read without looking at labels
 pub const STAT_TIME: egui::Color32 = egui::Color32::from_rgb(132, 172, 214);
 pub const STAT_SPEED: egui::Color32 = egui::Color32::from_rgb(126, 186, 128);

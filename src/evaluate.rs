@@ -4,6 +4,10 @@
 // value, and standing on a good square is worth a little more. On top of that come
 // the bishop pair and where the king wants to stand, both read off the game phase.
 //
+// The pieces are read off the board's bitboards rather than by walking all 64 squares:
+// a full board turns the loop 32 times instead of 64, and which piece type is being
+// scored is the loop's own rather than something to look up per square.
+//
 // The phase counts pieces, not centipawns: TOTAL_PHASE with everything standing,
 // 0 once only kings and pawns are left. Weights that differ between the two ends are
 // written W(middlegame, endgame). The board keeps the count; nothing here walks for it.
@@ -39,6 +43,10 @@ const BISHOP_BASE: i16 = 300;
 const PAWN_BASE: i16 = 100;
 
 pub const MATE: i32 = 100_000;
+
+// a score at least this far up is a mate rather than a count of material - no run of
+// captures reaches it, so anything above it is a mate a search proved
+pub const MATE_BOUND: i32 = MATE - 1_000;
 
 
 // the pair tells more as the board empties
@@ -150,6 +158,15 @@ const TOTAL_PHASE: i32 = 2 * (2 * PieceType::Knight.phase_weight()
     + 2 * PieceType::Rook.phase_weight()
     + PieceType::Queen.phase_weight());
 
+// everything but the king, which king_score does once the phase is in hand
+const SCORED_TYPES: [PieceType; 5] = [
+    PieceType::Pawn,
+    PieceType::Knight,
+    PieceType::Bishop,
+    PieceType::Rook,
+    PieceType::Queen,
+];
+
 // evaluate the current side vs the enemy side: positive is good for the side to move
 pub fn evaluate(board: &Board) -> i32 {
     let mut score = 0;
@@ -157,26 +174,33 @@ pub fn evaluate(board: &Board) -> i32 {
     let mut bishops = [0; 2];
     let mut knights = [0; 2];
 
-    for square in 0..64 {
-        let Some(piece) = board.piece_at(square) else {
-            continue;
-        };
-        let piece_type = piece.piece_type();
+    for color in Color::BOTH {
+        for piece_type in SCORED_TYPES {
+            let mut pieces = board.piece_board(piece_type, color);
+            let count = pieces.count_ones() as usize;
 
-        match piece_type {
-            PieceType::Pawn | PieceType::Rook | PieceType::Queen => can_mate = true,
-            PieceType::Bishop => bishops[color_index(piece.color())] += 1,
-            PieceType::Knight => knights[color_index(piece.color())] += 1,
-            // scored in king_score instead, once the phase is in hand
-            PieceType::King => continue,
+            match piece_type {
+                PieceType::Bishop => bishops[color_index(color)] = count,
+                PieceType::Knight => knights[color_index(color)] = count,
+                // a side that still has one of these has something to mate with
+                _ => can_mate |= count > 0,
+            }
+
+            // one turn per piece standing rather than one per square, and the type is
+            // the loop's own instead of something to read off the board
+            while pieces != 0 {
+                let square = pieces.trailing_zeros() as u8;
+                // takes the lowest bit back off, which is the square just read
+                pieces &= pieces - 1;
+
+                let value = piece_score(piece_type, color, square) as i32;
+                // white counts up, black counts down
+                score += match color {
+                    Color::White => value,
+                    Color::Black => -value,
+                };
+            }
         }
-
-        let value = piece_score(piece_type, piece.color(), square) as i32;
-        // white counts up, black counts down
-        score += match piece.color() {
-            Color::White => value,
-            Color::Black => -value,
-        };
     }
 
     // a game nobody can win any more is worth the same as one that already ended
