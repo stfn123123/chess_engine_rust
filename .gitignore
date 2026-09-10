@@ -3,3 +3,6 @@
 /assets/positions.txt
 /assets/games.txt
 /assets/stockfish-windows-x86-64-universal.exe
+/assets/stockfish-linux
+/benchmark_results/
+/scripts/.venv/

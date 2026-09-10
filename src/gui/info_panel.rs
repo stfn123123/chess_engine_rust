@@ -10,11 +10,12 @@ use std::time::Duration;
 
 use super::theme::{
     ACCENT, BLACK_SIDE, CALM, DANGER, PANEL_BG, PANEL_BORDER, STAT_EVAL, STAT_SPEED, STAT_TIME,
-    TEXT_MUTED, TEXT_PRIMARY, WARNING, WHITE_SIDE,
+    TEXT_MUTED, TEXT_PRIMARY, WHITE_SIDE,
 };
-use super::{ChessApp, SearchStats, Tone};
+use super::{ChessApp, SearchStats};
 use crate::board::piece::{Color, PieceType};
 use crate::evaluate::MATE;
+use crate::stockfish;
 
 pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
@@ -40,12 +41,21 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
             // the scroll area copies the layout it was given, but say it again so this
             // block cannot be broken by whatever encloses the panel later on
             ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new("CHESS")
-                        .size(20.0)
-                        .strong()
-                        .color(TEXT_PRIMARY),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("CHESS")
+                            .size(20.0)
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    );
+
+                    let button_size = egui::vec2(150.0, 28.0);
+                    let gap = ui.spacing().item_spacing.x;
+                    let used = button_size.x * 2.0 + gap;
+                    ui.add_space((ui.available_width() - used).max(0.0));
+
+                    autoplay_buttons(app, ui, button_size);
+                });
                 ui.add_space(12.0);
                 divider(ui);
                 ui.add_space(16.0);
@@ -55,9 +65,9 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
                 ui.columns(2, |columns| {
                     let left = &mut columns[0];
                     turn_block(app, left);
-                    status_block(app, left);
                     evaluation_block(app, left);
                     phase_block(app, left);
+                    library_position_block(app, left);
 
                     divider(left);
                     left.add_space(16.0);
@@ -76,12 +86,21 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
         });
 }
 
-// whose move it is, as a disc in that side's colour next to its name
+// whose move it is, as a disc in that side's colour next to its name - once the
+// game has ended this shows the result instead, under the same heading
 fn turn_block(app: &ChessApp, ui: &mut egui::Ui) {
-    let turn = app.board.turn();
-    let (name, disc) = match turn {
-        Color::White => ("White", WHITE_SIDE),
-        Color::Black => ("Black", BLACK_SIDE),
+    let (name, disc) = if app.board.is_checkmate() {
+        match app.board.winner() {
+            Color::White => ("White won", WHITE_SIDE),
+            Color::Black => ("Black won", BLACK_SIDE),
+        }
+    } else if app.game_over() {
+        ("Draw", TEXT_MUTED)
+    } else {
+        match app.board.turn() {
+            Color::White => ("White", WHITE_SIDE),
+            Color::Black => ("Black", BLACK_SIDE),
+        }
     };
 
     label(ui, "TO MOVE");
@@ -104,33 +123,13 @@ fn turn_block(app: &ChessApp, ui: &mut egui::Ui) {
     ui.add_space(18.0);
 }
 
-// how the game stands, coloured by how much attention it wants
-fn status_block(app: &ChessApp, ui: &mut egui::Ui) {
-    let color = match app.tone {
-        Tone::Calm => CALM,
-        Tone::Warning => WARNING,
-        Tone::Over => DANGER,
-    };
-
-    label(ui, "STATUS");
-    ui.add_space(4.0);
-    // wrapped, so a long line like "Draw - insufficient material" stays in the panel
-    ui.label(
-        egui::RichText::new(&app.status)
-            .size(15.0)
-            .strong()
-            .color(color),
-    );
-    ui.add_space(18.0);
-}
-
 // how the position stands after the last move, in pawns from white's point of view
 fn evaluation_block(app: &ChessApp, ui: &mut egui::Ui) {
     let (value, color) = match app.evaluation {
         Some(score) => (format_evaluation(score), STAT_EVAL),
         // nothing was worked out for this position, because the engine is turned off
         None if !app.analysis_enabled => ("off".to_string(), TEXT_MUTED),
-        // the game is over, so the status line above is the whole story
+        // the game is over, so the to-move block above is the whole story
         None => ("-".to_string(), TEXT_MUTED),
     };
 
@@ -140,6 +139,26 @@ fn evaluation_block(app: &ChessApp, ui: &mut egui::Ui) {
 // the share of the opening pieces still on the board, for tuning
 fn phase_block(app: &ChessApp, ui: &mut egui::Ui) {
     stat_block(ui, "GAME PHASE", &format!("{:.2}", app.phase), TEXT_PRIMARY);
+}
+
+// what the library recorded for this position, once one has been loaded from the
+// "Stored" window - the moves as a plain list, since the library keeps only one
+// evaluation per position rather than one per move
+fn library_position_block(app: &ChessApp, ui: &mut egui::Ui) {
+    let Some(loaded) = &app.loaded_library_position else {
+        return;
+    };
+
+    label(ui, "LIBRARY MOVES");
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(loaded.moves.join(", "))
+            .size(14.0)
+            .color(TEXT_PRIMARY),
+    );
+    ui.add_space(18.0);
+
+    stat_block(ui, "LIBRARY EVAL", &format_stockfish_score(&loaded.eval), STAT_EVAL);
 }
 
 // what the last search found, and what it cost, each in its own colour
@@ -349,14 +368,33 @@ fn testing_blocks(app: &mut ChessApp, ui: &mut egui::Ui) {
     }
     ui.add_space(6.0);
 
-    autoplay_buttons(app, ui, full_width);
-    ui.add_space(6.0);
-
     // one run whatever the toggle says: with the engine off this is the only way to
-    // search, and with it on it searches the same position again, for a second timing
-    if panel_button(ui, "Run Search", ACCENT, egui::vec2(full_width, 34.0)) {
+    // search, and with it on it searches the same position again, for a second timing.
+    // the depth field feeds every search, automatic or manual, so it can be tuned
+    // without a recompile
+    let mut run_search = false;
+    ui.horizontal(|ui| {
+        let field = 56.0;
+        let gap = ui.spacing().item_spacing.x;
+        let rest = (full_width - field - gap).max(0.0);
+
+        ui.add_sized(
+            [field, 34.0],
+            egui::DragValue::new(&mut app.search_depth).range(1..=20),
+        );
+        run_search = panel_button(ui, "Run Search", ACCENT, egui::vec2(rest, 34.0));
+    });
+    if run_search {
         app.analyse_once();
     }
+    ui.add_space(6.0);
+
+    // hands the position to the bundled Stockfish and shows its top answers below,
+    // for checking this engine's move choices against a much stronger one
+    if panel_button(ui, "Ask Stockfish", ACCENT, egui::vec2(full_width, 34.0)) {
+        app.ask_stockfish();
+    }
+    stockfish_result_block(app, ui);
     ui.add_space(6.0);
 
     if panel_button(
@@ -374,13 +412,84 @@ fn testing_blocks(app: &mut ChessApp, ui: &mut egui::Ui) {
     }
     ui.add_space(6.0);
 
+    let stored_color = if app.show_stored_window { CALM } else { TEXT_PRIMARY };
+    if panel_button(ui, "Stored", stored_color, egui::vec2(full_width, 34.0)) {
+        app.show_stored_window = !app.show_stored_window;
+    }
+    ui.add_space(6.0);
+
     perft_block(app, ui, full_width);
-    ui.add_space(16.0);
 
-    saved_positions_block(app, ui);
-    ui.add_space(16.0);
+    stored_window(app, ui.ctx());
+}
 
-    saved_games_block(app, ui);
+// the stored positions, saved games and the stockfish library, behind the "Stored"
+// button rather than always taking up panel space for lists that are usually empty
+fn stored_window(app: &mut ChessApp, ctx: &egui::Context) {
+    if !app.show_stored_window {
+        return;
+    }
+
+    let mut open = true;
+    egui::Window::new("Stored")
+        .open(&mut open)
+        .resizable(true)
+        .default_width(320.0)
+        .default_height(480.0)
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    saved_positions_block(app, ui);
+                    ui.add_space(16.0);
+                    saved_games_block(app, ui);
+                    ui.add_space(16.0);
+                    library_positions_block(app, ui);
+                });
+        });
+
+    if !open {
+        app.show_stored_window = false;
+    }
+}
+
+// the pre-computed stockfish library: click a row to load that position, and its
+// moves and evaluation show in the left column without asking stockfish again
+fn library_positions_block(app: &mut ChessApp, ui: &mut egui::Ui) {
+    label(ui, "STOCKFISH LIBRARY");
+    ui.add_space(6.0);
+
+    if app.library_positions.is_empty() {
+        ui.label(
+            egui::RichText::new("No positions generated yet")
+                .size(13.0)
+                .color(TEXT_MUTED),
+        );
+        ui.add_space(18.0);
+        return;
+    }
+
+    let mut load = None;
+
+    for (index, position) in app.library_positions.iter().enumerate() {
+        let row = format!(
+            "#{} {} ({})",
+            index + 1,
+            position.moves.first().map(String::as_str).unwrap_or("-"),
+            format_stockfish_score(&position.eval)
+        );
+
+        if panel_button(ui, &row, TEXT_PRIMARY, egui::vec2(ui.available_width(), 28.0)) {
+            load = Some(index);
+        }
+        ui.add_space(4.0);
+    }
+
+    ui.add_space(14.0);
+
+    if let Some(index) = load {
+        app.load_library_position(index);
+    }
 }
 
 // the game currently being stepped through, if any: which move it is on, and the
@@ -475,13 +584,14 @@ fn saved_games_block(app: &mut ChessApp, ui: &mut egui::Ui) {
 
 // lets each side's moves be handed to the engine instead of played by hand - the
 // state it is in now, not the state a click would put it in, same as the evaluation
-// toggle above
-fn autoplay_buttons(app: &mut ChessApp, ui: &mut egui::Ui, full_width: f32) {
+// toggle. Sits in the header next to the title, so it reads the same regardless of
+// which layout direction `ui` is in when it's called
+fn autoplay_buttons(app: &mut ChessApp, ui: &mut egui::Ui, size: egui::Vec2) {
     let (label, color) = match app.autoplay_white {
         true => ("Autoplay White: On", CALM),
         false => ("Autoplay White: Off", TEXT_MUTED),
     };
-    if panel_button(ui, label, color, egui::vec2(full_width, 34.0)) {
+    if panel_button(ui, label, color, size) {
         app.autoplay_white = !app.autoplay_white;
     }
     ui.add_space(6.0);
@@ -490,7 +600,7 @@ fn autoplay_buttons(app: &mut ChessApp, ui: &mut egui::Ui, full_width: f32) {
         true => ("Autoplay Black: On", CALM),
         false => ("Autoplay Black: Off", TEXT_MUTED),
     };
-    if panel_button(ui, label, color, egui::vec2(full_width, 34.0)) {
+    if panel_button(ui, label, color, size) {
         app.autoplay_black = !app.autoplay_black;
     }
 }
@@ -532,6 +642,41 @@ fn perft_block(app: &mut ChessApp, ui: &mut egui::Ui, full_width: f32) {
 
     if run {
         app.count_positions();
+    }
+}
+
+// stockfish's top answers to the last "Ask Stockfish" click, ranked best first - or
+// why there is nothing to show, if the binary would not talk UCI
+fn stockfish_result_block(app: &ChessApp, ui: &mut egui::Ui) {
+    match &app.stockfish_result {
+        None => {}
+        Some(Err(error)) => {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(error).size(12.0).color(DANGER));
+        }
+        Some(Ok(lines)) => {
+            ui.add_space(6.0);
+            for line in lines {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}. {} ({})",
+                        line.rank,
+                        line.best_move,
+                        format_stockfish_score(&line.score)
+                    ))
+                    .size(14.0)
+                    .color(TEXT_PRIMARY),
+                );
+                ui.add_space(2.0);
+            }
+        }
+    }
+}
+
+fn format_stockfish_score(score: &stockfish::StockfishScore) -> String {
+    match score {
+        stockfish::StockfishScore::Centipawns(cp) => format!("{:+.2}", *cp as f32 / 100.0),
+        stockfish::StockfishScore::MateIn(moves) => format!("mate in {}", moves.abs()),
     }
 }
 
@@ -608,18 +753,23 @@ fn panel_button(
 }
 
 // one switch per bitboard, so a board can be put on the position and watched through
-// the move types that are worth seeing rather than trusting
+// the move types that are worth seeing rather than trusting - tucked behind a toggle
+// button, since most of the time none of this is worth looking at
 fn bitboard_blocks(app: &mut ChessApp, ui: &mut egui::Ui) {
     ui.add_space(10.0);
     divider(ui);
     ui.add_space(14.0);
 
-    ui.label(
-        egui::RichText::new("BITBOARDS")
-            .size(12.0)
-            .strong()
-            .color(ACCENT),
-    );
+    let full_width = ui.available_width();
+    let text_color = if app.bitboards_expanded { CALM } else { TEXT_MUTED };
+    if panel_button(ui, "Bitboards", text_color, egui::vec2(full_width, 30.0)) {
+        app.bitboards_expanded = !app.bitboards_expanded;
+    }
+
+    if !app.bitboards_expanded {
+        return;
+    }
+
     ui.add_space(10.0);
 
     ui.columns(2, |columns| {

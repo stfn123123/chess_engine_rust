@@ -48,7 +48,7 @@ use crate::transposition::{NodeType, TranspositionTable};
 use std::time::{Duration, Instant};
 
 // how deep the search runs unless something asks for another depth
-pub const DEFAULT_DEPTH: u32 = 10;
+pub const DEFAULT_DEPTH: u32 = 6;
 
 const INFINITY: i32 = 1_000_000;
 

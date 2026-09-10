@@ -22,6 +22,8 @@ use crate::board::piece::{Color, PieceType};
 use crate::evaluate::{evaluate, game_phase_of};
 use crate::search;
 use crate::search::DepthPass;
+use crate::stockfish;
+use crate::stockfish_library;
 
 // the panel is a fixed width, wide enough for its two columns, the board gets the rest
 const PANEL_WIDTH: f32 = 480.0;
@@ -97,17 +99,6 @@ struct Replay {
     ply: usize,
 }
 
-// how urgently a status line should read
-#[derive(Clone, Copy, PartialEq)]
-enum Tone {
-    // the game is running as usual
-    Calm,
-    // someone is in check and has to answer it
-    Warning,
-    // the game is over, one way or another
-    Over,
-}
-
 pub struct ChessApp {
     board: Board,
     settings: Settings,
@@ -118,18 +109,31 @@ pub struct ChessApp {
     selected: Option<u8>,
     // where that piece may legally go, so the board can mark those squares
     legal_targets: Vec<u8>,
-    status: String,
-    tone: Tone,
+    // whether the game has ended, one way or another - no more moves are taken once
+    // this is set
+    is_game_over: bool,
     // how the position on the board stands, in centipawns from white's point of
     // view - None once the game is over, when there is nothing left to weigh
     evaluation: Option<i32>,
     // how late the game is: 1.00 on the opening board, 0.00 once the pieces are off
     phase: f32,
     last_search: Option<SearchStats>,
+    // how deep the engine searches, set in the panel - starts at the setting the app
+    // was launched with, but can be changed without a recompile
+    search_depth: u32,
     // how deep the next position count goes, set in the panel
     perft_depth: u32,
     // what the last position count found, dropped as soon as the board changes
     last_perft: Option<PerftStats>,
+    // the bundled Stockfish's answer to the "Ask Stockfish" button, dropped as soon
+    // as the board changes - an Err is a binary that would not talk UCI, not a draw
+    stockfish_result: Option<Result<Vec<stockfish::StockfishLine>, String>>,
+    // the pre-computed positions the "Stored" window can load, read once at startup
+    // from assets/stockfish_library.txt
+    library_positions: Vec<stockfish_library::LibraryPosition>,
+    // what the library recorded for the position currently on the board, once one of
+    // library_positions has been loaded - dropped as soon as the board changes
+    loaded_library_position: Option<stockfish_library::LibraryPosition>,
     // whether the engine weighs and searches after every move - turned off, a position
     // can be set up a move at a time without waiting for a search at every click
     analysis_enabled: bool,
@@ -152,11 +156,24 @@ pub struct ChessApp {
     shown_bitboards: [[bool; 6]; 2],
     // whether the attack table's answer for the selected piece is drawn over the board
     show_attacks: bool,
+    // whether the bitboard settings are expanded in the panel, rather than tucked
+    // behind their toggle button
+    bitboards_expanded: bool,
+    // whether the stored-positions/saved-games window is open
+    show_stored_window: bool,
 }
 
 impl ChessApp {
     fn new(settings: Settings) -> Self {
-        ChessApp::with_state(settings, true, false, false, storage::load(), storage::load_games())
+        ChessApp::with_state(
+            settings,
+            true,
+            false,
+            false,
+            storage::load(),
+            storage::load_games(),
+            stockfish_library::load(),
+        )
     }
 
     // a fresh game that keeps what belongs to the session rather than to the game:
@@ -168,6 +185,7 @@ impl ChessApp {
         autoplay_black: bool,
         saved_positions: Vec<SavedPosition>,
         saved_games: Vec<SavedGame>,
+        library_positions: Vec<stockfish_library::LibraryPosition>,
     ) -> Self {
         let mut board = Board::new();
         board.set_start_position();
@@ -184,13 +202,16 @@ impl ChessApp {
             engine,
             selected: None,
             legal_targets: Vec::new(),
-            status: String::new(),
-            tone: Tone::Calm,
+            is_game_over: false,
             evaluation: None,
             phase: 1.0,
             last_search: None,
+            search_depth: settings.search_depth,
             perft_depth: 4,
             last_perft: None,
+            stockfish_result: None,
+            library_positions,
+            loaded_library_position: None,
             analysis_enabled,
             autoplay_white,
             autoplay_black,
@@ -200,6 +221,8 @@ impl ChessApp {
             replay: None,
             shown_bitboards: [[false; 6]; 2],
             show_attacks: false,
+            bitboards_expanded: false,
+            show_stored_window: false,
         };
         app.position_changed();
         app
@@ -208,9 +231,12 @@ impl ChessApp {
     fn reset(&mut self) {
         let saved_positions = std::mem::take(&mut self.saved_positions);
         let saved_games = std::mem::take(&mut self.saved_games);
+        let library_positions = std::mem::take(&mut self.library_positions);
         // belongs to the session rather than to the game, like the toggles above it
         let shown_bitboards = self.shown_bitboards;
         let show_attacks = self.show_attacks;
+        let bitboards_expanded = self.bitboards_expanded;
+        let show_stored_window = self.show_stored_window;
         *self = ChessApp::with_state(
             self.settings,
             self.analysis_enabled,
@@ -218,22 +244,29 @@ impl ChessApp {
             self.autoplay_black,
             saved_positions,
             saved_games,
+            library_positions,
         );
         self.shown_bitboards = shown_bitboards;
         self.show_attacks = show_attacks;
+        self.bitboards_expanded = bitboards_expanded;
+        self.show_stored_window = show_stored_window;
     }
 
     // the game has ended, so no more moves are taken
     fn game_over(&self) -> bool {
-        self.tone == Tone::Over
+        self.is_game_over
     }
 
-    // status first, since the evaluation asks it whether the game is still running
+    // game-over state first, since the evaluation asks it whether the game is still running
     fn position_changed(&mut self) {
         self.last_move_at = Instant::now();
-        self.refresh_status();
+        self.refresh_game_over();
         // the old count belongs to the position that was on the board before this one
         self.last_perft = None;
+        // same for whatever stockfish last said - it answered the position before this one
+        self.stockfish_result = None;
+        // and for the library entry, if the position that changed away was loaded from one
+        self.loaded_library_position = None;
         // the phase is a property of the position rather than a verdict on it, so it
         // stays up to date even with the engine turned off
         self.phase = game_phase_of(&self.board);
@@ -255,6 +288,12 @@ impl ChessApp {
     fn analyse_once(&mut self) {
         self.refresh_evaluation();
         self.run_search();
+    }
+
+    // hands the position to the bundled Stockfish and keeps its answer to show in
+    // the panel - blocks the click that asked for it, the same as Run Search does
+    fn ask_stockfish(&mut self) {
+        self.stockfish_result = Some(stockfish::best_moves(&self.board));
     }
 
     // weighs the position as it now stands
@@ -305,6 +344,22 @@ impl ChessApp {
         self.board = board;
         self.clear_selection();
         self.position_changed();
+    }
+
+    // puts a library position on the board and keeps what stockfish was recorded to
+    // think of it, so the panel can show it without asking stockfish again
+    fn load_library_position(&mut self, index: usize) {
+        let Some(position) = self.library_positions.get(index).cloned() else {
+            return;
+        };
+        let Ok(board) = Board::from_fen(&position.fen) else {
+            return;
+        };
+
+        self.board = board;
+        self.clear_selection();
+        self.position_changed();
+        self.loaded_library_position = Some(position);
     }
 
     fn forget_position(&mut self, index: usize) {
@@ -404,7 +459,7 @@ impl ChessApp {
     // searches the position for the best move and records what that cost; called
     // whenever the position on the board changes
     fn run_search(&mut self) {
-        let depth = self.settings.search_depth;
+        let depth = self.search_depth;
         let start = Instant::now();
         let result = self.engine.find_best_move(&mut self.board, depth);
         let duration = start.elapsed();
@@ -445,29 +500,13 @@ impl ChessApp {
         });
     }
 
-    // recomputes the status line and how urgently it reads
-    fn refresh_status(&mut self) {
-        let turn = self.board.turn();
-
-        let (status, tone) = if self.board.is_checkmate() {
-            let winner = self.board.winner();
-            (format!("Checkmate - {winner:?} wins"), Tone::Over)
-        } else if self.board.is_stalemate() {
-            ("Stalemate - draw".to_string(), Tone::Over)
-        } else if self.board.insufficient_material() {
-            ("Draw - insufficient material".to_string(), Tone::Over)
-        } else if self.board.is_threefold_repetition() {
-            ("Draw - threefold repetition".to_string(), Tone::Over)
-        } else if self.board.is_fifty_move_draw() {
-            ("Draw - fifty move rule".to_string(), Tone::Over)
-        } else if self.board.is_check(turn) {
-            (format!("{turn:?} is in check"), Tone::Warning)
-        } else {
-            ("Game in progress".to_string(), Tone::Calm)
-        };
-
-        self.status = status;
-        self.tone = tone;
+    // recomputes whether the game has ended
+    fn refresh_game_over(&mut self) {
+        self.is_game_over = self.board.is_checkmate()
+            || self.board.is_stalemate()
+            || self.board.insufficient_material()
+            || self.board.is_threefold_repetition()
+            || self.board.is_fifty_move_draw();
     }
 
     // handles a click on `square`: either plays the selected piece there, if that is

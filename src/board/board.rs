@@ -1,10 +1,14 @@
 // The board: where the pieces stand, whose turn it is, and how a move is played
 // and taken back again. Move generation itself lives in `movegen`.
 
-use crate::board::castling::{CastleSide, CastlingRights, rook_castle_square, rook_start_square};
+use crate::board::castling::{
+    CASTLE_FLAGS, CastleSide, CastlingRights, rook_castle_square, rook_start_square,
+};
 use crate::board::chess_move::{Move, MoveRecord};
 use crate::board::piece::{Color, Piece, PieceType};
-use crate::board::square::{bit, en_passant_captured_square, file_of, offset, rank_of};
+use crate::board::square::{
+    bit, en_passant_captured_square, file_of, offset, rank_of, square_from_name, square_name,
+};
 use crate::board::zobrist::ZOBRIST;
 
 // cloned to put a position aside and come back to it later, history and all - the
@@ -516,6 +520,181 @@ pub fn insufficient_minors(bishops: [usize; 2], knights: [usize; 2]) -> bool {
 
     (white_minors == 0 && bishops[1] == 0 && knights[1] == 2)
         || (black_minors == 0 && bishops[0] == 0 && knights[0] == 2)
+}
+
+// -------------------- FEN --------------------
+impl Board {
+    // the position as FEN: piece placement, side to move, castling rights, en passant
+    // target and halfmove clock. The fullmove number is not worth tracking just for
+    // this, so it is always written as 1 - a placeholder that keeps the FEN valid for
+    // tools that expect all six fields, though nothing here reads it back
+    pub fn to_fen(&self) -> String {
+        let turn = match self.turn {
+            Color::White => "w",
+            Color::Black => "b",
+        };
+        let en_passant = match self.capturable_en_passant_target() {
+            Some(square) => square_name(square),
+            None => "-".to_string(),
+        };
+
+        format!(
+            "{} {turn} {} {en_passant} {} 1",
+            self.fen_placement(),
+            self.fen_castling(),
+            self.halfmove_clock,
+        )
+    }
+
+    // rank 8 down to rank 1, each written a-file to h-file with runs of empty
+    // squares collapsed into a digit, exactly as FEN expects
+    fn fen_placement(&self) -> String {
+        (0..8)
+            .rev()
+            .map(|rank| {
+                let mut row = String::new();
+                let mut empty = 0u32;
+
+                for file in 0..8 {
+                    match self.squares[(rank * 8 + file) as usize] {
+                        Some(piece) => {
+                            if empty > 0 {
+                                row.push_str(&empty.to_string());
+                                empty = 0;
+                            }
+                            row.push(piece.symbol());
+                        }
+                        None => empty += 1,
+                    }
+                }
+                if empty > 0 {
+                    row.push_str(&empty.to_string());
+                }
+
+                row
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    fn fen_castling(&self) -> String {
+        let letters = [
+            (Color::White, CastleSide::King, 'K'),
+            (Color::White, CastleSide::Queen, 'Q'),
+            (Color::Black, CastleSide::King, 'k'),
+            (Color::Black, CastleSide::Queen, 'q'),
+        ];
+
+        let castling: String = letters
+            .into_iter()
+            .filter(|&(color, side, _)| self.castling_rights.get(color, side))
+            .map(|(_, _, letter)| letter)
+            .collect();
+
+        if castling.is_empty() { "-".to_string() } else { castling }
+    }
+
+    // rebuilds a position from FEN - the board comes back with empty history, so this
+    // is for setting up a starting point rather than replaying into a game in progress
+    pub fn from_fen(fen: &str) -> Result<Board, String> {
+        let mut fields = fen.split_whitespace();
+
+        let placement = fields.next().ok_or("empty FEN")?;
+        let turn = fields.next().unwrap_or("w");
+        let castling = fields.next().unwrap_or("-");
+        let en_passant = fields.next().unwrap_or("-");
+        let halfmove_clock = match fields.next() {
+            Some(text) => text
+                .parse()
+                .map_err(|_| format!("'{text}' is not a halfmove clock"))?,
+            None => 0,
+        };
+        // the fullmove number is not worth tracking just for this - whatever a FEN
+        // gives for it is simply dropped
+
+        let mut board = Board::new();
+        board.place_fen_pieces(placement)?;
+
+        board.turn = match turn {
+            "w" => Color::White,
+            "b" => Color::Black,
+            other => return Err(format!("'{other}' is not a side to move")),
+        };
+        // the hash was built for White to move; only Black needs the key folded in
+        if board.turn == Color::Black {
+            board.hash ^= ZOBRIST.side_to_move();
+        }
+
+        let mut rights = CastlingRights::ALL;
+        for (color, side) in CASTLE_FLAGS {
+            let letter = match (color, side) {
+                (Color::White, CastleSide::King) => 'K',
+                (Color::White, CastleSide::Queen) => 'Q',
+                (Color::Black, CastleSide::King) => 'k',
+                (Color::Black, CastleSide::Queen) => 'q',
+            };
+            if !castling.contains(letter) {
+                rights.clear(color, side);
+            }
+        }
+        board.set_castling_rights(rights);
+
+        // set last: it reads the pieces and the side to move to decide whether the
+        // target square is really capturable
+        let target = match en_passant {
+            "-" => None,
+            name => Some(square_from_name(name).ok_or_else(|| format!("'{name}' is not a square"))?),
+        };
+        board.set_en_passant_target(target);
+
+        board.halfmove_clock = halfmove_clock;
+
+        debug_assert_eq!(board.hash, board.full_hash(), "fen import hash mismatch");
+        debug_assert_eq!(board.phase, board.counted_phase(), "fen import phase mismatch");
+
+        Ok(board)
+    }
+
+    // reads one FEN placement field onto an empty board, rank 8 first as FEN writes it
+    fn place_fen_pieces(&mut self, placement: &str) -> Result<(), String> {
+        let ranks: Vec<&str> = placement.split('/').collect();
+        if ranks.len() != 8 {
+            return Err(format!("expected 8 ranks, found {}", ranks.len()));
+        }
+
+        for (rank_from_top, row) in ranks.iter().enumerate() {
+            let rank = 7 - rank_from_top as u8;
+            let mut file = 0u8;
+
+            for symbol in row.chars() {
+                if let Some(empty) = symbol.to_digit(10) {
+                    file += empty as u8;
+                    continue;
+                }
+
+                if file >= 8 {
+                    return Err(format!("rank \"{row}\" is too wide"));
+                }
+
+                let color = if symbol.is_ascii_uppercase() {
+                    Color::White
+                } else {
+                    Color::Black
+                };
+                let piece_type = PieceType::from_letter(symbol.to_ascii_lowercase())
+                    .ok_or_else(|| format!("'{symbol}' is not a piece"))?;
+
+                self.add_piece(Piece::new(piece_type, color), rank * 8 + file);
+                file += 1;
+            }
+
+            if file != 8 {
+                return Err(format!("rank \"{row}\" does not fill 8 files"));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // -------------------- keeping the hash in sync --------------------
