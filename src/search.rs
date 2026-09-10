@@ -416,33 +416,35 @@ impl Search {
         let mut best_move = None;
         let mut tried = 0;
         // asked for at most once a node, and only where a move gets late enough to be reduced
-        let mut in_check = None;
+        // let mut in_check = None;
 
         while let Some(chess_move) = order.next() {
             tried += 1;
 
-            // what the ordering is confident about is searched in full: the early moves, anything
-            // that takes or promotes, the killers, and every move of a node that is under check
-            let late = depth >= LMR_MIN_DEPTH
-                && tried >= LMR_FIRST_REDUCED
-                && chess_move.captured.is_none()
-                && chess_move.promotion.is_none()
-                && !killers.contains(&Some(chess_move))
-                && !*in_check.get_or_insert_with(|| board.is_check(board.turn()));
+            // LMR disabled for now, unverified - see TODO above. Kept, not removed.
+            // // what the ordering is confident about is searched in full: the early moves, anything
+            // // that takes or promotes, the killers, and every move of a node that is under check
+            // let late = depth >= LMR_MIN_DEPTH
+            //     && tried >= LMR_FIRST_REDUCED
+            //     && chess_move.captured.is_none()
+            //     && chess_move.promotion.is_none()
+            //     && !killers.contains(&Some(chess_move))
+            //     && !*in_check.get_or_insert_with(|| board.is_check(board.turn()));
 
             board.make_move(&chess_move);
 
             // a move that gives check forces the replies, so its subtree is small enough to keep whole
-            let reduction = if late && !board.is_check(board.turn()) {
-                self.lmr_reductions += 1;
-                if depth >= LMR_DEEP_DEPTH && tried >= LMR_LATE_MOVE {
-                    2
-                } else {
-                    1
-                }
-            } else {
-                0
-            };
+            // let reduction = if late && !board.is_check(board.turn()) {
+            //     self.lmr_reductions += 1;
+            //     if depth >= LMR_DEEP_DEPTH && tried >= LMR_LATE_MOVE {
+            //         2
+            //     } else {
+            //         1
+            //     }
+            // } else {
+            //     0
+            // };
+            let reduction = 0;
 
             // a reduced move only has to fail low, so it's asked the cheapest question there is
             let mut score = if reduction > 0 {
