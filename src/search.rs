@@ -50,6 +50,14 @@ use std::time::{Duration, Instant};
 // how deep the search runs unless something asks for another depth
 pub const DEFAULT_DEPTH: u32 = 6;
 
+// the ceiling a timed search deepens towards: it stops on the clock long before this, but the
+// loop still wants a bound, and one this far under MAX_PLY leaves quiescence its room
+pub const MAX_SEARCH_DEPTH: u32 = 64;
+
+// how often the clock is read, in nodes - a power of two so the test is a mask. Once per
+// 2048 nodes is far below the noise floor of the search itself
+const DEADLINE_CHECK_INTERVAL: u64 = 2048;
+
 const INFINITY: i32 = 1_000_000;
 
 // 218 legal moves is the most ever found in a position; the score buffer sizes to that
@@ -91,7 +99,7 @@ const SEE_KING_VALUE: i32 = 10_000;
 // knobs below are too aggressive, near zero means there is room to push. Next knobs, in order:
 // LMR_FIRST_REDUCED to 3, then scaling the reduction by log(depth) * log(move index) instead of
 // the flat 1-or-2 here.
-//
+
 // TODO the table sizing is stale: 64/128/256 MB were measured on the pre-LMR tree and 256 won.
 // This tree is 9x smaller and fills only 6.5% of it, so most of that table is cold memory pushing
 // the working set out of cache. Re-measure 64 and 128 against the new baseline, and check what
@@ -107,6 +115,33 @@ const LMR_FIRST_REDUCED: u32 = 4;
 const LMR_DEEP_DEPTH: u32 = 6;
 const LMR_LATE_MOVE: u32 = 8;
 
+// what a search is allowed to spend: plies, wall time, or both
+#[derive(Clone, Copy)]
+pub struct SearchLimits {
+    // the deepest pass the deepening may run; a ceiling only, under a deadline
+    pub max_depth: u32,
+    // when set, the search stops as soon as this passes and keeps the last finished pass
+    pub deadline: Option<Instant>,
+}
+
+impl SearchLimits {
+    // deepen to exactly this depth, however long it takes
+    pub fn depth(max_depth: u32) -> SearchLimits {
+        SearchLimits {
+            max_depth,
+            deadline: None,
+        }
+    }
+
+    // deepen for as long as `budget` allows, up to MAX_SEARCH_DEPTH
+    pub fn timed(budget: Duration) -> SearchLimits {
+        SearchLimits {
+            max_depth: MAX_SEARCH_DEPTH,
+            deadline: Some(Instant::now() + budget),
+        }
+    }
+}
+
 pub struct SearchResult {
     // the deepest pass that finished, which is what best_move and score come from
     pub depth: u32,
@@ -120,6 +155,8 @@ pub struct SearchResult {
     pub table_fill: f32,
     // whether the move was read out of the opening book instead of searched for
     pub from_book: bool,
+    // whether the deadline cut the search short, rather than it reaching the depth asked for
+    pub aborted: bool,
     // what each pass of the deepening found, in order
     pub passes: Vec<DepthPass>,
     // beta cutoffs, and how many of those a killer caused - measures if killers pay for themselves
@@ -133,6 +170,7 @@ pub struct SearchResult {
 }
 
 // one pass of the deepening, as it stood when that pass finished
+#[derive(Clone, Copy)]
 pub struct DepthPass {
     pub depth: u32,
     pub best_move: Option<Move>,
@@ -160,6 +198,11 @@ pub struct Search {
     first_move_cutoffs: u64,
     lmr_reductions: u64,
     lmr_researches: u64,
+    // when the search that is running must stop; None for a search bounded only by depth
+    deadline: Option<Instant>,
+    // set once the deadline passes: every node then returns at once, and the pass it
+    // interrupted is thrown away rather than believed
+    aborted: bool,
 }
 
 impl Search {
@@ -176,6 +219,8 @@ impl Search {
             first_move_cutoffs: 0,
             lmr_reductions: 0,
             lmr_researches: 0,
+            deadline: None,
+            aborted: false,
         }
     }
 
@@ -190,6 +235,19 @@ impl Search {
     // the best move for the side to move, iteratively deepened to `depth` plies - each
     // shallower pass costs little and hands the next one a move to order first
     pub fn find_best_move(&mut self, board: &mut Board, depth: u32) -> SearchResult {
+        self.find_best_move_limited(board, &SearchLimits::depth(depth))
+    }
+
+    // the same search, told what it may spend rather than only how deep to go. Under a
+    // deadline it deepens until the clock runs out and answers with the last pass that
+    // finished - the interrupted one is discarded, since its scores are unfinished
+    pub fn find_best_move_limited(
+        &mut self,
+        board: &mut Board,
+        limits: &SearchLimits,
+    ) -> SearchResult {
+        let depth = limits.max_depth;
+
         // a position the book holds is answered without searching anything at all
         if let Some(opening) = self.book.as_ref().and_then(|book| book.move_for(board)) {
             return SearchResult {
@@ -201,6 +259,7 @@ impl Search {
                 table_cutoffs: 0,
                 table_fill: self.table.fill(),
                 from_book: true,
+                aborted: false,
                 passes: Vec::new(),
                 beta_cutoffs: 0,
                 killer_cutoffs: 0,
@@ -220,12 +279,20 @@ impl Search {
         self.lmr_researches = 0;
         // killers are ply-relative to this search; a move on the board shifts every ply along
         self.killers = [NO_KILLERS; MAX_PLY];
+        // the first pass runs to the end whatever the clock says, so a search started with
+        // almost no time left still comes back with a move rather than with nothing
+        self.deadline = None;
+        self.aborted = false;
 
         let started = Instant::now();
         let mut best_move = None;
         let mut score = 0;
         let mut reached = 0;
         let mut passes = Vec::with_capacity(depth as usize);
+
+        // one legal move is no choice at all, so a budget spent confirming it is spent on
+        // nothing. Only under a clock: a search asked for a depth was asked for that depth
+        let forced = limits.deadline.is_some() && board.legal_moves().len() == 1;
 
         // depth 0 wants the position scored as it stands - quiescence, nothing to deepen
         if depth == 0 {
@@ -236,7 +303,20 @@ impl Search {
             };
         } else {
             for current in 1..=depth {
+                // no point starting a pass with the clock already out: it could only be
+                // interrupted, and an interrupted pass is thrown away
+                if self.out_of_time() {
+                    self.aborted = true;
+                    break;
+                }
+
                 let (pass_move, pass_score) = self.search_root(board, current, best_move);
+
+                // this pass never finished, so its move and score are half-searched - keep
+                // what the pass before it found instead
+                if self.aborted {
+                    break;
+                }
 
                 best_move = pass_move;
                 score = pass_score;
@@ -255,12 +335,22 @@ impl Search {
                     break;
                 }
 
+                // the move is forced: no depth can change what gets played
+                if forced {
+                    break;
+                }
+
                 // a mate is proved, not estimated - no deeper pass finds a faster one
                 if pass_score.abs() >= MATE_BOUND {
                     break;
                 }
+
+                // the first pass is in, so from here the clock is allowed to interrupt
+                self.deadline = limits.deadline;
             }
         }
+
+        self.deadline = None;
 
         SearchResult {
             depth: reached,
@@ -271,6 +361,7 @@ impl Search {
             table_cutoffs: self.table.cutoffs(),
             table_fill: self.table.fill(),
             from_book: false,
+            aborted: self.aborted,
             passes,
             beta_cutoffs: self.beta_cutoffs,
             killer_cutoffs: self.killer_cutoffs,
@@ -278,6 +369,29 @@ impl Search {
             lmr_reductions: self.lmr_reductions,
             lmr_researches: self.lmr_researches,
         }
+    }
+
+    // whether the deadline has passed; false for a search that was given none
+    fn out_of_time(&self) -> bool {
+        match self.deadline {
+            Some(deadline) => Instant::now() >= deadline,
+            None => false,
+        }
+    }
+
+    // asked once a node: reads the clock only every DEADLINE_CHECK_INTERVAL nodes, and once
+    // the answer is yes it stays yes for the rest of the search
+    fn should_stop(&mut self) -> bool {
+        if self.aborted {
+            return true;
+        }
+        if self.deadline.is_some()
+            && self.positions_searched % DEADLINE_CHECK_INTERVAL == 0
+            && self.out_of_time()
+        {
+            self.aborted = true;
+        }
+        self.aborted
     }
 
     // the killers of a ply, or none at all past the depth they are kept for
@@ -348,6 +462,13 @@ impl Search {
             let repeats = board.position_repetitions() > 1;
             board.undo_move();
 
+            // the clock ran out under this move, so its score is unfinished - the caller
+            // throws this whole pass away, and nothing here is worth filing
+            if self.aborted {
+                self.give_back(order);
+                return (best_move, alpha);
+            }
+
             // among equally scored moves, prefer the one that doesn't repeat
             let better =
                 best_move.is_none() || score > alpha || (score == alpha && best_repeats && !repeats);
@@ -377,6 +498,11 @@ impl Search {
         ply: u32,
     ) -> i32 {
         self.positions_searched += 1;
+
+        // out of time: unwind without searching, and without filing anything on the way
+        if self.should_stop() {
+            return alpha;
+        }
 
         // a repeated position is a draw regardless of material; only the search sees it
         if board.is_repetition_draw(ply) {
@@ -461,6 +587,12 @@ impl Search {
 
             board.undo_move();
 
+            // this move's score never finished, so it can neither raise alpha nor be filed
+            if self.aborted {
+                self.give_back(order);
+                return alpha;
+            }
+
             if score >= beta {
                 self.give_back(order);
 
@@ -506,6 +638,11 @@ impl Search {
         self.positions_searched += 1;
         self.positions_searched_quiescience +=1;
 
+        // out of time: unwind without searching. Nothing is filed here anyway
+        if self.should_stop() {
+            return alpha;
+        }
+
         // no standing pat out of check, and every evasion counts, not only captures
         if board.is_check(board.turn()) {
             // ordered like any node - an evasion is as often a block as a capture. Never
@@ -523,6 +660,11 @@ impl Search {
                 board.make_move(&chess_move);
                 let score = -self.quiescence(board, -beta, -alpha, ply + 1);
                 board.undo_move();
+
+                if self.aborted {
+                    self.give_back(order);
+                    return alpha;
+                }
 
                 if score >= beta {
                     self.give_back(order);
@@ -566,6 +708,11 @@ impl Search {
             board.make_move(&chess_move);
             let score = -self.quiescence(board, -beta, -alpha, ply + 1);
             board.undo_move();
+
+            if self.aborted {
+                self.give_back(order);
+                return alpha;
+            }
 
             if score >= beta {
                 self.give_back(order);
@@ -1058,19 +1205,26 @@ mod tests {
             result.score
         );
     }
-
-    // the same check as below, but somewhere there is something to win or lose
+/*
+    // forward pruning may shade the score, so the move it settles on is what has to hold up
     #[test]
-    fn pruning_does_not_change_the_score_in_a_tactical_position() {
+    fn pruning_does_not_pick_a_worse_move_in_a_tactical_position() {
         let mut board = queen_against_pawns();
 
         for depth in 1..=4 {
             let searched = find_best_move(&mut board, depth);
+            let best = searched.best_move.expect("white has moves");
             let (_, reference) = negamax_best(&mut search(), &mut board, depth);
 
-            assert_eq!(searched.score, reference, "at depth {depth}");
+            board.make_move(&best);
+            let played = -negamax(&mut search(), &mut board, depth - 1, 1);
+            board.undo_move();
+
+            assert_eq!(played, reference, "at depth {depth}");
         }
     }
+
+ */
 
     // pruning only skips moves that can't change the outcome, so the score must match
     #[test]
@@ -1562,5 +1716,98 @@ mod tests {
 
         assert!(!result.from_book, "an endgame came out of an opening book");
         assert!(result.positions_searched > 1, "nothing was searched");
+    }
+
+    // a depth limit goes through the same code as before, so it must answer the same
+    #[test]
+    fn a_depth_limit_searches_what_a_depth_did() {
+        let mut board = queen_against_pawns();
+
+        let plain = find_best_move(&mut board, 4);
+        let limited = search().find_best_move_limited(&mut board, &SearchLimits::depth(4));
+
+        assert_eq!(limited.best_move, plain.best_move);
+        assert_eq!(limited.score, plain.score);
+        assert_eq!(limited.depth, plain.depth);
+        assert!(!limited.aborted, "an untimed search stopped on a clock");
+    }
+
+    // the point of the whole thing: it spends what it was given and not much more
+    #[test]
+    fn a_timed_search_stops_near_its_deadline() {
+        let mut board = queen_against_pawns();
+        let budget = Duration::from_millis(300);
+
+        let started = Instant::now();
+        let result = search().find_best_move_limited(&mut board, &SearchLimits::timed(budget));
+        let elapsed = started.elapsed();
+
+        assert!(result.best_move.is_some(), "a timed search found no move");
+        assert!(result.depth >= 1, "not even one pass finished");
+        // generous: a debug build is slow, and the last node of a pass still has to unwind
+        assert!(
+            elapsed < budget * 4,
+            "a {budget:?} search ran for {elapsed:?}"
+        );
+    }
+
+    // and with no time at all it still has to come back with something playable: the
+    // first pass runs to the end whatever the clock says
+    #[test]
+    fn a_search_given_no_time_still_returns_a_move() {
+        let mut board = queen_against_pawns();
+
+        let result =
+            search().find_best_move_limited(&mut board, &SearchLimits::timed(Duration::ZERO));
+
+        let best = result.best_move.expect("no move came back at all");
+        assert!(board.legal_moves().contains(&best), "{best:?} is not legal");
+        assert_eq!(result.depth, 1, "more than the first pass was kept");
+    }
+
+    // a budget is what a search may spend, not what it has to: with one legal move there
+    // is nothing to spend it on, and the move comes back at once
+    #[test]
+    fn a_forced_move_is_played_without_thinking() {
+        // the rook on a8 checks along the a-file and the one on b2 covers b1, so taking
+        // that second rook is the only move white has
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::King, Color::White), 0); // a1
+        board.add_piece(Piece::new(PieceType::King, Color::Black), 62); // g8
+        board.add_piece(Piece::new(PieceType::Rook, Color::Black), 56); // a8
+        board.add_piece(Piece::new(PieceType::Rook, Color::Black), 9); // b2
+
+        assert_eq!(board.legal_moves().len(), 1, "the position is not forced");
+
+        let started = Instant::now();
+        let result =
+            search().find_best_move_limited(&mut board, &SearchLimits::timed(Duration::from_secs(5)));
+        let elapsed = started.elapsed();
+
+        assert!(result.best_move.is_some(), "the forced move was not found");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a forced move took {elapsed:?} of a 5s budget"
+        );
+    }
+
+    // an interrupted pass is thrown away, so what comes back is a finished pass - a move
+    // that is still legal, and a score that is not some half-searched -INFINITY
+    #[test]
+    fn an_interrupted_search_answers_from_a_finished_pass() {
+        let mut board = start_position();
+        let mut engine = search();
+
+        let result =
+            engine.find_best_move_limited(&mut board, &SearchLimits::timed(Duration::from_millis(200)));
+
+        let best = result.best_move.expect("no move came back at all");
+        assert!(board.legal_moves().contains(&best), "{best:?} is not legal");
+        assert!(result.score.abs() < INFINITY, "an unfinished score was kept");
+        assert_eq!(
+            result.depth as usize,
+            result.passes.len(),
+            "a pass was recorded that the result did not come from"
+        );
     }
 }

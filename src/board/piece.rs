@@ -47,8 +47,7 @@ impl PieceType {
         }
     }
 
-    // what this piece counts towards the game phase - kings and pawns count nothing,
-    // since a board of nothing but pawns is an endgame
+    // what this piece counts towards the game phase - kings and pawns count nothing
     pub const fn phase_weight(self) -> i32 {
         match self {
             PieceType::King | PieceType::Pawn => 0,

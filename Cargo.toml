@@ -3,6 +3,12 @@ name = "chess_engine"
 version = "0.1.0"
 edition = "2024"
 
+# the GUI binary is found on its own at src/main.rs; this one has to be named, and links
+# none of the GUI - see the header of src/uci_main.rs
+[[bin]]
+name = "uci"
+path = "src/uci_main.rs"
+
 [dependencies]
 eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 egui_extras = { version = "0.36.1", features = ["svg"] }

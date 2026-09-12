@@ -19,9 +19,10 @@ use crate::Settings;
 use crate::board::Board;
 use crate::board::chess_move::Move;
 use crate::board::piece::{Color, PieceType};
+use crate::clock::{GameClock, TimeControl};
 use crate::evaluate::{evaluate, game_phase_of};
 use crate::search;
-use crate::search::DepthPass;
+use crate::search::{DepthPass, SearchLimits};
 use crate::stockfish;
 use crate::stockfish_library;
 
@@ -31,11 +32,18 @@ const GAP: f32 = 18.0;
 // below this the board is unusable, so it stops shrinking with the window
 const MIN_BOARD_SIZE: f32 = 240.0;
 // autoplay waits this long after a move lands before playing the next one, so a game
-// reads as a sequence of moves rather than a flicker
+// reads as a sequence of moves rather than a flicker. Skipped on a clock, where the
+// thinking is the pause and the wait would come out of someone's time
 const AUTOPLAY_DELAY: Duration = Duration::from_millis(800);
+
+// how often the panel redraws while a clock is counting down with nothing else happening
+const CLOCK_TICK: Duration = Duration::from_millis(100);
 
 // what the last search found, and what it cost, as shown in the side panel
 struct SearchStats {
+    // the position it was run on: after a timed move these stats are the move that was
+    // just played, so they no longer belong to what is on the board
+    position: u64,
     // the deepest pass of the deepening that finished
     depth: u32,
     // the move the search would play here, None once the game is over
@@ -121,6 +129,18 @@ pub struct ChessApp {
     // how deep the engine searches, set in the panel - starts at the setting the app
     // was launched with, but can be changed without a recompile
     search_depth: u32,
+    // what bounds a move the engine plays, set in the panel: a depth, a time per move,
+    // or a game clock. Only the last one makes the clocks below run
+    time_control: TimeControl,
+    // what each side has left, once a clocked game has been started
+    clock: GameClock,
+    // what the time control fields in the panel are set to, kept as their own numbers so
+    // the mode can be switched back and forth without them being lost
+    clock_minutes: u64,
+    clock_increment: u64,
+    move_seconds: u64,
+    // how long the last move the engine played was given, to show beside what it spent
+    last_budget: Option<Duration>,
     // how deep the next position count goes, set in the panel
     perft_depth: u32,
     // what the last position count found, dropped as soon as the board changes
@@ -170,19 +190,22 @@ impl ChessApp {
             true,
             false,
             false,
+            settings.time_control,
             storage::load(),
             storage::load_games(),
             stockfish_library::load(),
         )
     }
 
-    // a fresh game that keeps what belongs to the session rather than to the game:
-    // the analysis toggle, the autoplay toggles, and what was put aside or saved so far
+    // a fresh game that keeps what belongs to the session rather than to the game: the
+    // analysis toggle, the autoplay toggles, the time control, and what was put aside or
+    // saved so far. The clocks themselves are new - they belong to the game
     fn with_state(
         settings: Settings,
         analysis_enabled: bool,
         autoplay_white: bool,
         autoplay_black: bool,
+        time_control: TimeControl,
         saved_positions: Vec<SavedPosition>,
         saved_games: Vec<SavedGame>,
         library_positions: Vec<stockfish_library::LibraryPosition>,
@@ -196,6 +219,17 @@ impl ChessApp {
             search::Search::without_book(settings.table_megabytes)
         };
 
+        // the panel's fields start on whatever the control in force is set to, so a new
+        // game under 5+3 does not come up reading 10+0
+        let (clock_minutes, clock_increment) = match time_control {
+            TimeControl::Clock { base, increment } => (base.as_secs() / 60, increment.as_secs()),
+            _ => (10, 0),
+        };
+        let move_seconds = match time_control {
+            TimeControl::MoveTime(budget) => budget.as_secs().max(1),
+            _ => 15,
+        };
+
         let mut app = ChessApp {
             board,
             settings,
@@ -207,6 +241,12 @@ impl ChessApp {
             phase: 1.0,
             last_search: None,
             search_depth: settings.search_depth,
+            time_control,
+            clock: GameClock::new(time_control),
+            clock_minutes,
+            clock_increment,
+            move_seconds,
+            last_budget: None,
             perft_depth: 4,
             last_perft: None,
             stockfish_result: None,
@@ -242,6 +282,7 @@ impl ChessApp {
             self.analysis_enabled,
             self.autoplay_white,
             self.autoplay_black,
+            self.time_control,
             saved_positions,
             saved_games,
             library_positions,
@@ -278,6 +319,15 @@ impl ChessApp {
         if !self.analysis_enabled {
             self.evaluation = None;
             self.last_search = None;
+            return;
+        }
+
+        // when the engine plays to a time, the move it plays is searched to that budget
+        // in autoplay_step. A second search here would cost just as much again, on
+        // whoever is now to move's clock, and would replace the stats of the move that
+        // was actually played with its own. The evaluation is static, so that keeps up
+        if self.plays_to_time() {
+            self.refresh_evaluation();
             return;
         }
 
@@ -401,6 +451,9 @@ impl ChessApp {
             return;
         };
 
+        // the live game is on hold while its moves are stepped through, and so is its clock
+        self.clock.pause();
+
         self.replay = Some(Replay {
             live_board: self.board.clone(),
             moves: saved.board.moves_played(),
@@ -457,14 +510,22 @@ impl ChessApp {
     }
 
     // searches the position for the best move and records what that cost; called
-    // whenever the position on the board changes
+    // whenever the position on the board changes. This is analysis rather than play, so
+    // it goes by the panel's depth and never touches the clocks - a position can be set
+    // up a move at a time without it costing anyone time
     fn run_search(&mut self) {
-        let depth = self.search_depth;
+        let limits = SearchLimits::depth(self.search_depth);
+        self.search_with(&limits);
+    }
+
+    // one search under whatever bounds it was given, recorded in the panel either way
+    fn search_with(&mut self, limits: &SearchLimits) {
         let start = Instant::now();
-        let result = self.engine.find_best_move(&mut self.board, depth);
+        let result = self.engine.find_best_move_limited(&mut self.board, limits);
         let duration = start.elapsed();
 
         self.last_search = Some(SearchStats {
+            position: self.board.hash(),
             // what the search reached, which is not the depth asked for when a mate
             // was proved on the way up and the passes after it were dropped
             depth: result.depth,
@@ -506,7 +567,96 @@ impl ChessApp {
             || self.board.is_stalemate()
             || self.board.insufficient_material()
             || self.board.is_threefold_repetition()
-            || self.board.is_fifty_move_draw();
+            || self.board.is_fifty_move_draw()
+            || self.clock.flagged().is_some();
+
+        // a finished game does not go on costing the side to move time
+        if self.is_game_over {
+            self.clock.pause();
+        }
+    }
+
+    // whether a clocked game is under way, which is what makes the engine play to a
+    // budget instead of to the depth in the panel
+    fn clock_is_running(&self) -> bool {
+        self.time_control.is_clocked() && self.clock.is_running()
+    }
+
+    // the Start/Pause control: starting puts the side to move on the clock, pausing
+    // stops it where it is. Only a clocked time control has anything to start
+    fn toggle_clock(&mut self) {
+        if !self.time_control.is_clocked() || self.game_over() {
+            return;
+        }
+
+        if self.clock.is_running() {
+            self.clock.pause();
+        } else {
+            self.clock.start(self.board.turn());
+        }
+    }
+
+    // the time control changed in the panel, so the clocks start again from its base -
+    // changing from 10+0 to 5+3 halfway through a game would be nonsense otherwise
+    fn set_time_control(&mut self, control: TimeControl) {
+        if control == self.time_control {
+            return;
+        }
+
+        self.time_control = control;
+        self.clock = GameClock::new(control);
+        self.last_budget = None;
+        self.refresh_game_over();
+    }
+
+    // how long the engine may think about the move it is on, or None when the panel is
+    // set to a depth rather than to a time
+    fn move_budget(&self) -> Option<Duration> {
+        match self.time_control {
+            TimeControl::Depth => None,
+            TimeControl::MoveTime(budget) => Some(budget),
+            // a clock nobody has started is not a clock to spend out of: until Start is
+            // pressed the panel's depth bounds a move, as it does without a clock at all
+            TimeControl::Clock { .. } if !self.clock.is_running() => None,
+            TimeControl::Clock { .. } => {
+                let side = self.board.turn();
+                Some(self.clock.budget_for(side, self.time_control))
+            }
+        }
+    }
+
+    // whether the engine is playing to a time rather than to the panel's depth
+    fn plays_to_time(&self) -> bool {
+        self.move_budget().is_some()
+    }
+
+    // what bounds the move the engine is about to play
+    fn move_limits(&self) -> SearchLimits {
+        match self.move_budget() {
+            Some(budget) => SearchLimits::timed(budget),
+            None => SearchLimits::depth(self.search_depth),
+        }
+    }
+
+    // the side on the clock has run out: the game ends there, however the position stands
+    fn check_flag(&mut self) {
+        if self.clock.check_flag().is_some() && !self.is_game_over {
+            self.refresh_game_over();
+        }
+    }
+
+    // `side` has just put a move on the board: what it spent comes off its clock and the
+    // increment goes back on. Does nothing at all unless a clocked game is under way
+    fn record_move_on_clock(&mut self, side: Color) {
+        if !self.clock_is_running() {
+            return;
+        }
+
+        let increment = match self.time_control {
+            TimeControl::Clock { increment, .. } => increment,
+            _ => Duration::ZERO,
+        };
+        self.clock.move_played(side, increment);
     }
 
     // handles a click on `square`: either plays the selected piece there, if that is
@@ -518,9 +668,12 @@ impl ChessApp {
 
         if let Some(from) = self.selected {
             if self.legal_targets.contains(&square) {
+                let side = self.board.turn();
                 // the GUI has no promotion dialog yet, so a promoting pawn becomes a queen
                 self.board
                     .make_move_from_squares(from, square, Some(PieceType::Queen));
+                // a player is on the clock exactly as the engine is
+                self.record_move_on_clock(side);
                 self.clear_selection();
                 self.position_changed();
                 return;
@@ -565,18 +718,35 @@ impl ChessApp {
             return;
         }
 
-        // wait out the pause before playing the next move, so the board is readable
-        // move to move rather than racing through the game
-        let elapsed = self.last_move_at.elapsed();
-        if elapsed < AUTOPLAY_DELAY {
-            ctx.request_repaint_after(AUTOPLAY_DELAY - elapsed);
-            return;
+        // wait out the pause before playing the next move, so the board is readable move
+        // to move rather than racing through the game. Playing to a time there is no
+        // pause: the thinking is the pause, and on a clock the wait would be someone's
+        if !self.plays_to_time() {
+            let elapsed = self.last_move_at.elapsed();
+            if elapsed < AUTOPLAY_DELAY {
+                ctx.request_repaint_after(AUTOPLAY_DELAY - elapsed);
+                return;
+            }
         }
 
-        // analysis may be turned off, in which case nothing has searched this
-        // position yet - autoplay needs a move regardless of that toggle
-        if self.last_search.is_none() {
-            self.analyse_once();
+        let side = self.board.turn();
+        let budget = self.move_budget();
+
+        // a timed move is searched here and now, to its own budget - the analysis search
+        // that may have run at this position was bounded by the panel's depth instead.
+        // Without a clock an analysis of this very position stands, where there is one:
+        // analysis may be off, and after a timed move the last search belongs to the
+        // position before this one, which is no move to play here
+        let searched_here = self
+            .last_search
+            .as_ref()
+            .is_some_and(|stats| stats.position == self.board.hash());
+
+        if budget.is_some() || !searched_here {
+            self.last_budget = budget;
+            self.refresh_evaluation();
+            let limits = self.move_limits();
+            self.search_with(&limits);
         }
 
         let Some(best_move) = self.last_search.as_ref().and_then(|stats| stats.best_move) else {
@@ -584,6 +754,10 @@ impl ChessApp {
         };
 
         self.board.make_move(&best_move);
+
+        // the move is on the board, so what the search spent comes off that side's clock
+        self.record_move_on_clock(side);
+
         self.clear_selection();
         self.position_changed();
         ctx.request_repaint();
@@ -592,7 +766,16 @@ impl ChessApp {
 
 impl eframe::App for ChessApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // asked before anything is drawn, so a flag that fell while a human sat thinking
+        // ends the game on this frame rather than on their next click
+        self.check_flag();
         self.autoplay_step(ui.ctx());
+
+        // a clock counting down is the one thing that changes with nobody touching
+        // anything, so the window has to be asked to come back on its own
+        if self.clock_is_running() && !self.game_over() {
+            ui.ctx().request_repaint_after(CLOCK_TICK);
+        }
 
         let available = ui.available_size();
         // the board is square, so it takes the smaller of what is left beside the

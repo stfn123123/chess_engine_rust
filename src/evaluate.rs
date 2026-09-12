@@ -1,33 +1,12 @@
-// How good a position is, in centipawns.
-//
-// The score is material plus a piece-square bonus: every piece is worth a base
-// value, and standing on a good square is worth a little more. On top of that come
-// the bishop pair and where the king wants to stand, both read off the game phase.
-//
-// The pieces are read off the board's bitboards rather than by walking all 64 squares:
-// a full board turns the loop 32 times instead of 64, and which piece type is being
-// scored is the loop's own rather than something to look up per square.
-//
-// The phase counts pieces, not centipawns: TOTAL_PHASE with everything standing,
-// 0 once only kings and pawns are left. Weights that differ between the two ends are
-// written W(middlegame, endgame). The board keeps the count; nothing here walks for it.
-//
-// The score is always for the side to move: positive means the side whose turn it
-// is stands better, whichever side that is. That is what negamax wants - it only
-// ever asks "how good is this for me", and negates the answer one ply up.
-//
-// Everything is counted from white's point of view first and only flipped at the
-// very end, so the two sides can never drift apart.
-
 use crate::board::Board;
 use crate::board::board::insufficient_minors;
-use crate::board::piece::{Color, PieceType};
+use crate::board::piece::{Color, Piece, PieceType};
+use crate::board::square::file_of;
 
 type Psqt = [i16; 64];
-type PsqtSet = [Psqt; 6];
+type PsqtSet = [Psqt; 4];
 
-// W(middlegame, endgame)
-struct W(i16, i16);
+struct W(i16, i16); // (middlegame, endgame)
 
 impl W {
     fn at(self, phase: i32) -> i32 {
@@ -43,14 +22,12 @@ const BISHOP_BASE: i16 = 300;
 const PAWN_BASE: i16 = 100;
 
 pub const MATE: i32 = 100_000;
-
-// a score at least this far up is a mate rather than a count of material - no run of
-// captures reaches it, so anything above it is a mate a search proved
 pub const MATE_BOUND: i32 = MATE - 1_000;
 
-
-// the pair tells more as the board empties
 const BISHOP_PAIR: W = W(10, 40);
+
+const ISOLATED_PAWN: i32 = -40;
+const PASSED_PAWN: i32 = 50;
 
 const QUEEN: Psqt = [
     -20,-10,-10, -5, -5,-10,-10,-20,
@@ -107,6 +84,39 @@ const PAWN: Psqt = [
     0,  0,  0,  0,  0,  0,  0,  0
 ];
 
+const PAWN_AFTER_CASTLE_KING: Psqt = [
+    0,  0,  0,  0,  0,  0,  0,  0,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    10, 10, 20, 30, 30, 20, 10, 10,
+    5,  5, 10, 25, 25,  5,  0,  0,
+    5,  5,  5, 20, 20, -5, -5, -5,
+    5,  5,  5,  0,  0,-10, -5, 5,
+    0,  0,  0,-20,-20, 15, 15, 10,
+    0,  0,  0,  0,  0,  0,  0,  0
+];
+
+const PAWN_AFTER_CASTLE_QUEEN: Psqt = [
+     0,  0,  0,  0,  0,  0,  0,  0,
+     50, 50, 50, 50, 50, 50, 50, 50,
+     10, 10, 20, 30, 30, 20, 10, 10,
+     0,  0, 5, 25, 25, 10,  5,  5,
+    -5, -5, -5, 20, 20,  5,  5,  5,
+     5, -5,-10,  0,  0,  5,  5,  5,
+     10, 15, 15,-20,-20,  0,  0,  0,
+      0,  0,  0,  0,  0,  0,  0,  0
+];
+
+const PAWN_LATE: Psqt = [
+      0,  0,  0,  0,  0,  0,  0,  0,
+     50, 50, 50, 50, 50, 50, 50, 50,
+     20, 30, 30, 30, 30, 30, 30, 20,
+     10, 10, 10, 25, 25, 10, 10, 10,
+      5,  5,  5, 20, 20,  5,  5,  5,
+     -5, -5,-10,  0,  0,-10, -5, -5,
+    -10,-10,-10,-20,-20,-10,-10,-10,
+      0,  0,  0,  0,  0,  0,  0,  0
+];
+
 const KING_MID: Psqt = [
     -30,-40,-40,-50,-50,-40,-40,-30,
     -30,-40,-40,-50,-50,-40,-40,-30,
@@ -118,8 +128,6 @@ const KING_MID: Psqt = [
     20, 30, 10,  0,  0, 10, 30, 20
 ];
 
-// the king is the one piece whose good squares turn around by the endgame - corner
-// early, centre late, interpolated between
 const KING_END: Psqt = [
     -50,-40,-30,-20,-20,-30,-40,-50,
     -30,-20,-10,  0,  0,-10,-20,-30,
@@ -131,18 +139,87 @@ const KING_END: Psqt = [
     -50,-30,-30,-30,-30,-30,-30,-50
 ];
 
-const FLIP: [usize; 64] = [
-    56, 57, 58, 59, 60, 61, 62, 63,
-    48, 49, 50, 51, 52, 53, 54, 55,
-    40, 41, 42, 43, 44, 45, 46, 47,
-    32, 33, 34, 35, 36, 37, 38, 39,
-    24, 25, 26, 27, 28, 29, 30, 31,
-    16, 17, 18, 19, 20, 21, 22, 23,
-    8,  9, 10, 11, 12, 13, 14, 15,
-    0,  1,  2,  3,  4,  5,  6,  7,
+// every square on one file, a1 upwards
+const fn file_mask(file: usize) -> u64 {
+    0x0101_0101_0101_0101 << file
+}
+
+// every square on one rank, a-file to h-file
+const fn rank_mask(rank: usize) -> u64 {
+    0xff << (rank * 8)
+}
+
+// the two files either side of one, which is where a pawn's neighbours would stand
+const ADJACENT_FILES: [u64; 8] = {
+    let mut masks = [0; 8];
+    let mut file = 0;
+
+    while file < 8 {
+        if file > 0 {
+            masks[file] |= file_mask(file - 1);
+        }
+        if file < 7 {
+            masks[file] |= file_mask(file + 1);
+        }
+        file += 1;
+    }
+
+    masks
+};
+
+// every square an enemy pawn could stop a pawn on this square from: the three files
+// it walks past, on the ranks still ahead of it. Indexed by color, then square
+const PASSED_MASK: [[u64; 64]; 2] = {
+    let mut masks = [[0; 64]; 2];
+    let mut square = 0;
+
+    while square < 64 {
+        let file = square % 8;
+        let rank = square / 8;
+        let files = file_mask(file) | ADJACENT_FILES[file];
+
+        let mut white = 0;
+        let mut ahead = rank + 1;
+        while ahead < 8 {
+            white |= rank_mask(ahead);
+            ahead += 1;
+        }
+
+        let mut black = 0;
+        let mut behind = 0;
+        while behind < rank {
+            black |= rank_mask(behind);
+            behind += 1;
+        }
+
+        masks[0][square] = files & white;
+        masks[1][square] = files & black;
+        square += 1;
+    }
+
+    masks
+};
+
+// the base value is baked in at compile time, so a piece costs a single table read
+const fn with_base(mut table: Psqt, base: i16) -> Psqt {
+    let mut square = 0;
+    while square < 64 {
+        table[square] += base;
+        square += 1;
+    }
+    table
+}
+
+const TABLES: PsqtSet = [
+    with_base(KNIGHT, KNIGHT_BASE),
+    with_base(BISHOP, BISHOP_BASE),
+    with_base(ROOK, ROOK_BASE),
+    with_base(QUEEN, QUEEN_BASE),
 ];
 
-const TABLES: PsqtSet = [KING_MID, PAWN, KNIGHT, BISHOP, ROOK, QUEEN];
+// TABLES starts at the knight, BASE_VALUES at the king
+const PSQT_OFFSET: usize = PieceType::Knight.board_index();
+
 const BASE_VALUES: [i16; 6] = [
     KING_BASE,
     PAWN_BASE,
@@ -152,84 +229,62 @@ const BASE_VALUES: [i16; 6] = [
     QUEEN_BASE,
 ];
 
-// a full board, summed from the weights so retuning one cannot leave this behind
 const TOTAL_PHASE: i32 = 2 * (2 * PieceType::Knight.phase_weight()
     + 2 * PieceType::Bishop.phase_weight()
     + 2 * PieceType::Rook.phase_weight()
     + PieceType::Queen.phase_weight());
 
-// everything but the king, which king_score does once the phase is in hand
-const SCORED_TYPES: [PieceType; 5] = [
-    PieceType::Pawn,
-    PieceType::Knight,
-    PieceType::Bishop,
-    PieceType::Rook,
-    PieceType::Queen,
-];
+// the types that can still force a mate on their own
+const MATING_TYPES: [PieceType; 3] = [PieceType::Pawn, PieceType::Rook, PieceType::Queen];
 
-// evaluate the current side vs the enemy side: positive is good for the side to move
+// positive: side to move stands better
 pub fn evaluate(board: &Board) -> i32 {
-    let mut score = 0;
-    let mut can_mate = false;
-    let mut bishops = [0; 2];
-    let mut knights = [0; 2];
+    let bishops = counts_of(board, PieceType::Bishop);
+    let knights = counts_of(board, PieceType::Knight);
 
-    for color in Color::BOTH {
-        for piece_type in SCORED_TYPES {
-            let mut pieces = board.piece_board(piece_type, color);
-            let count = pieces.count_ones() as usize;
-
-            match piece_type {
-                PieceType::Bishop => bishops[color_index(color)] = count,
-                PieceType::Knight => knights[color_index(color)] = count,
-                // a side that still has one of these has something to mate with
-                _ => can_mate |= count > 0,
-            }
-
-            // one turn per piece standing rather than one per square, and the type is
-            // the loop's own instead of something to read off the board
-            while pieces != 0 {
-                let square = pieces.trailing_zeros() as u8;
-                // takes the lowest bit back off, which is the square just read
-                pieces &= pieces - 1;
-
-                let value = piece_score(piece_type, color, square) as i32;
-                // white counts up, black counts down
-                score += match color {
-                    Color::White => value,
-                    Color::Black => -value,
-                };
-            }
-        }
-    }
-
-    // a game nobody can win any more is worth the same as one that already ended
-    if !can_mate && insufficient_minors(bishops, knights) {
+    // cheap enough to ask before anything is scored
+    if !can_mate(board) && insufficient_minors(bishops, knights) {
         return 0;
     }
 
-    // clamped because a promotion can put more on than the game started with
+    let kings = [
+        board.king_square(Color::White),
+        board.king_square(Color::Black),
+    ];
     let phase = board.phase().clamp(0, TOTAL_PHASE);
-    score += king_score(board, phase);
+
+    // the knights, bishops, rooks and queens are already summed up by the board
+    let mut score = board.psqt();
+    score += pawn_score(board, kings, phase);
+    score += pawn_structure(board);
+    score += king_score(kings, phase);
     score += bishop_pair_score(bishops, phase);
 
-    // and now out of white's point of view and into the side to move's
-    match board.turn() {
-        Color::White => score,
-        Color::Black => -score,
+    signed(score, board.turn())
+}
+
+// what one piece contributes to the running total the board keeps - kings and pawns
+// are left out, since both are only scored once the phase is known
+pub(crate) fn incremental_score(piece: Piece, square: u8) -> i32 {
+    let index = piece.piece_type().board_index();
+    if index < PSQT_OFFSET {
+        return 0;
     }
+
+    let color = piece.color();
+    let value = TABLES[index - PSQT_OFFSET][table_index(square, color)];
+
+    signed(value as i32, color)
 }
 
 pub fn piece_value(piece_type: PieceType) -> i16 {
     BASE_VALUES[piece_type.board_index()]
 }
 
-
 pub fn game_phase_of(board: &Board) -> f32 {
     board.phase().clamp(0, TOTAL_PHASE) as f32 / TOTAL_PHASE as f32
 }
 
-// the two sides as the rows of the counting tables above
 fn color_index(color: Color) -> usize {
     match color {
         Color::White => 0,
@@ -237,45 +292,57 @@ fn color_index(color: Color) -> usize {
     }
 }
 
-fn piece_score(piece_type: PieceType, color: Color, square: u8) -> i16 {
-    let index = piece_type.board_index();
-    BASE_VALUES[index] + TABLES[index][table_index(square, color)]
+// white counts up, black counts down
+fn signed(value: i32, color: Color) -> i32 {
+    match color {
+        Color::White => value,
+        Color::Black => -value,
+    }
 }
 
+fn counts_of(board: &Board, piece_type: PieceType) -> [usize; 2] {
+    Color::BOTH.map(|color| board.piece_board(piece_type, color).count_ones() as usize)
+}
+
+fn can_mate(board: &Board) -> bool {
+    let mut mating = 0;
+
+    for color in Color::BOTH {
+        for piece_type in MATING_TYPES {
+            mating |= board.piece_board(piece_type, color);
+        }
+    }
+
+    mating != 0
+}
+
+// the tables are written from black's side, so white's squares are mirrored by rank
 fn table_index(square: u8, color: Color) -> usize {
     match color {
-        Color::White => FLIP[square as usize],
+        Color::White => (square ^ 56) as usize,
         Color::Black => square as usize,
     }
 }
 
-// integer on purpose: this is the innermost thing evaluate does
 fn interpolate(middlegame: i16, endgame: i16, phase: i32) -> i32 {
     (middlegame as i32 * phase + endgame as i32 * (TOTAL_PHASE - phase)) / TOTAL_PHASE
 }
 
-fn king_score(board: &Board, phase: i32) -> i32 {
+fn king_score(kings: [Option<u8>; 2], phase: i32) -> i32 {
     let mut score = 0;
 
     for color in Color::BOTH {
-        // None only on a hand built board
-        let Some(square) = board.king_square(color) else {
+        let Some(square) = kings[color_index(color)] else {
             continue;
         };
 
         let index = table_index(square, color);
-        let value = interpolate(KING_MID[index], KING_END[index], phase);
-
-        score += match color {
-            Color::White => value,
-            Color::Black => -value,
-        };
+        score += signed(interpolate(KING_MID[index], KING_END[index], phase), color);
     }
 
     score
 }
 
-// two or more, so a promoted third bishop does not pay twice
 fn bishop_pair_score(bishops: [usize; 2], phase: i32) -> i32 {
     let bonus = BISHOP_PAIR.at(phase);
     let mut score = 0;
@@ -289,17 +356,77 @@ fn bishop_pair_score(bishops: [usize; 2], phase: i32) -> i32 {
 
     score
 }
-// TODO: pawn structure (doubled/isolated/passed/weak)
-fn pawn_structure() -> i32 {
+fn pawn_score(board: &Board, kings: [Option<u8>; 2], phase: i32) -> i32 {
+    let mut score = 0;
+
+    for color in Color::BOTH {
+        let middlegame = pawn_table(kings[color_index(color)]);
+        let mut pawns = board.piece_board(PieceType::Pawn, color);
+        let mut side = 0;
+
+        while pawns != 0 {
+            let square = pawns.trailing_zeros() as u8;
+            pawns &= pawns - 1;
+
+            let index = table_index(square, color);
+            side += PAWN_BASE as i32 + interpolate(middlegame[index], PAWN_LATE[index], phase);
+        }
+
+        score += signed(side, color);
+    }
+
+    score
+}
+
+// a king on either outer three files has castled to that wing
+fn pawn_table(king: Option<u8>) -> &'static Psqt {
+    let Some(square) = king else {
+        return &PAWN;
+    };
+
+    match file_of(square) {
+        0..=2 => &PAWN_AFTER_CASTLE_QUEEN,
+        5..=7 => &PAWN_AFTER_CASTLE_KING,
+        _ => &PAWN,
+    }
+}
+
+// reward passed pawns, punish isolated ones
+fn pawn_structure(board: &Board) -> i32 {
+    let mut score = 0;
+
+    for color in Color::BOTH {
+        let friendly = board.piece_board(PieceType::Pawn, color);
+        let enemy = board.piece_board(PieceType::Pawn, color.opponent());
+        let mut pawns = friendly;
+        let mut side = 0;
+
+        while pawns != 0 {
+            let square = pawns.trailing_zeros() as u8;
+            pawns &= pawns - 1;
+
+            // the pawn stands on its own file, so it never matches its own mask
+            if friendly & ADJACENT_FILES[file_of(square) as usize] == 0 {
+                side += ISOLATED_PAWN;
+            }
+            if enemy & PASSED_MASK[color_index(color)][square as usize] == 0 {
+                side += PASSED_PAWN;
+            }
+        }
+
+        score += signed(side, color);
+    }
+
+    score
+}
+
+fn king_safety() -> i32 {
     return 0
 }
 
-
-
-
-
-
-
+fn rook_open_file() -> i32 {
+    return 0
+}
 
 #[cfg(test)]
 mod tests {
@@ -312,14 +439,11 @@ mod tests {
         board
     }
 
-    // the start position is the same for both sides, so nobody is ahead
     #[test]
     fn the_start_position_is_equal() {
         assert_eq!(evaluate(&start_position()), 0);
     }
 
-    // the clock everything else is read off has to sit at the two ends of its range
-    // where the range says it does, or every weight hanging off it is skewed
     #[test]
     fn the_phase_runs_from_a_full_board_down_to_bare_kings() {
         assert_eq!(game_phase_of(&start_position()), 1.0);
@@ -331,7 +455,6 @@ mod tests {
         assert_eq!(game_phase_of(&bare), 0.0);
     }
 
-    // the case the piece count is for - counting centipawns read this as 0.205
     #[test]
     fn a_pawn_endgame_is_all_the_way_into_the_endgame() {
         let mut board = Board::new();
@@ -344,6 +467,67 @@ mod tests {
         }
 
         assert_eq!(game_phase_of(&board), 0.0);
+    }
+
+    #[test]
+    fn the_pawn_psqts_are_roughly_balanced() {
+        let tables: [(&str, Psqt); 4] = [
+            ("PAWN", PAWN),
+            ("PAWN_AFTER_CASTLE_KING", PAWN_AFTER_CASTLE_KING),
+            ("PAWN_AFTER_CASTLE_QUEEN", PAWN_AFTER_CASTLE_QUEEN),
+            ("PAWN_LATE", PAWN_LATE),
+        ];
+
+        let mut sums = Vec::new();
+
+        for (name, table) in tables {
+            let sum: i32 = table.iter().map(|&v| v as i32).sum();
+            println!("{name} (sum = {sum}):");
+            sums.push(sum);
+        }
+
+        let min = *sums.iter().min().unwrap();
+        let max = *sums.iter().max().unwrap();
+
+        assert!(max - min <= 10, "pawn psqts differ too much: {sums:?}");
+    }
+
+    #[test]
+    fn every_pawn_still_has_a_neighbour_at_the_start() {
+        assert_eq!(pawn_structure(&start_position()), 0);
+    }
+
+    #[test]
+    fn a_pawn_with_both_neighbouring_files_empty_is_isolated() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::Pawn, Color::White), 8); // a2
+        board.add_piece(Piece::new(PieceType::Pawn, Color::White), 10); // c2
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 48); // a7
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 49); // b7
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 50); // c7
+
+        // the black chain holds up both white pawns, so only the isolation is left
+        assert_eq!(pawn_structure(&board), 2 * ISOLATED_PAWN);
+    }
+
+    #[test]
+    fn a_pawn_on_the_next_file_is_neighbour_enough() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::Pawn, Color::White), 12); // e2
+        board.add_piece(Piece::new(PieceType::Pawn, Color::White), 13); // f2
+
+        assert_eq!(pawn_structure(&board), 2 * PASSED_PAWN);
+    }
+
+    #[test]
+    fn a_passer_is_stopped_from_the_next_file_too() {
+        let mut board = Board::new();
+        board.add_piece(Piece::new(PieceType::Pawn, Color::White), 28); // e4
+        board.add_piece(Piece::new(PieceType::Pawn, Color::White), 29); // f4
+        board.add_piece(Piece::new(PieceType::Pawn, Color::Black), 51); // d7
+
+        // d7 holds up e4 from the side but never reaches f4, and is isolated itself
+        assert_eq!(pawn_structure(&board), PASSED_PAWN - ISOLATED_PAWN);
     }
 
     #[test]
@@ -364,15 +548,19 @@ mod tests {
         assert_eq!(bishop_pair_score([2, 2], 0), 0, "both sides have it");
     }
 
-    // same board, both ends of the phase - the answer has to change sign
     #[test]
     fn the_king_turns_around_towards_the_endgame() {
         let mut board = Board::new();
         board.add_piece(Piece::new(PieceType::King, Color::White), 28); // e4
         board.add_piece(Piece::new(PieceType::King, Color::Black), 62); // g8
 
-        assert!(king_score(&board, TOTAL_PHASE) < 0, "centre is bad early");
-        assert!(king_score(&board, 0) > 0, "centre is good late");
+        let kings = [
+            board.king_square(Color::White),
+            board.king_square(Color::Black),
+        ];
+
+        assert!(king_score(kings, TOTAL_PHASE) < 0, "centre is bad early");
+        assert!(king_score(kings, 0) > 0, "centre is good late");
     }
 
     #[test]
@@ -386,7 +574,6 @@ mod tests {
         assert!(score < 0, "black to move scored {score}");
     }
 
-    // mirrored moves make the position symmetric again, so it must read as equal
     #[test]
     fn a_symmetric_position_is_equal_again() {
         let mut board = start_position();
@@ -396,7 +583,6 @@ mod tests {
         assert_eq!(evaluate(&board), 0);
     }
 
-    // a side up a queen for nothing is up about a queen
     #[test]
     fn material_counts() {
         let mut board = Board::new();
@@ -404,7 +590,6 @@ mod tests {
         board.add_piece(Piece::new(PieceType::King, Color::Black), 60);
         board.add_piece(Piece::new(PieceType::Queen, Color::White), 3);
 
-        // white is the side to move on a fresh board, so the queen counts up
         let score = evaluate(&board);
         assert!(
             (QUEEN_BASE as i32 - 50..=QUEEN_BASE as i32 + 50).contains(&score),
@@ -412,8 +597,6 @@ mod tests {
         );
     }
 
-    // the same position mirrored has to score the same for the mirrored side, which
-    // is what tells a table lookup that is off by a rank from a correct one
     #[test]
     fn mirrored_positions_score_the_same() {
         let mut white_side = Board::new();
@@ -428,12 +611,9 @@ mod tests {
         black_side.add_piece(Piece::new(PieceType::Knight, Color::Black), 42); // c6
         black_side.add_piece(Piece::new(PieceType::Pawn, Color::Black), 36); // e5
 
-        // both boards have white to move, so the mirrored one scores the opposite
         assert_eq!(evaluate(&white_side), -evaluate(&black_side));
     }
 
-    // two knights cannot force a mate against a bare king, so being two knights up
-    // is being nothing up - the one case the counting has to get exactly right
     #[test]
     fn two_knights_against_a_bare_king_is_a_draw() {
         let mut board = Board::new();
@@ -445,8 +625,6 @@ mod tests {
         assert_eq!(evaluate(&board), 0);
     }
 
-    // but the same two knights against a knight is an ordinary position: black has a
-    // piece to lose, so white being a knight up counts
     #[test]
     fn a_knight_up_against_a_knight_still_counts() {
         let mut board = Board::new();
@@ -460,7 +638,6 @@ mod tests {
         assert!(score > 200, "a knight up scored {score}");
     }
 
-    // two bare kings: nobody can mate anybody, so there is nothing to be ahead by
     #[test]
     fn a_draw_by_material_is_worth_nothing() {
         let mut board = Board::new();

@@ -14,8 +14,12 @@ use super::theme::{
 };
 use super::{ChessApp, SearchStats};
 use crate::board::piece::{Color, PieceType};
+use crate::clock::{TimeControl, format_remaining};
 use crate::evaluate::MATE;
 use crate::stockfish;
+
+// the Start/Pause button beside the two clocks
+const BUTTON_WIDTH: f32 = 96.0;
 
 pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
@@ -62,6 +66,8 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
 
                 replay_controls_block(app, ui);
 
+                clock_block(app, ui);
+
                 ui.columns(2, |columns| {
                     let left = &mut columns[0];
                     turn_block(app, left);
@@ -86,10 +92,86 @@ pub fn show(app: &mut ChessApp, ui: &mut egui::Ui, width: f32, height: f32) {
         });
 }
 
+// the two clocks, side by side, with the side on the clock lit up. Only a clocked time
+// control has anything to show here - a depth or a fixed time per move has no clock
+fn clock_block(app: &mut ChessApp, ui: &mut egui::Ui) {
+    if !app.time_control.is_clocked() {
+        return;
+    }
+
+    let to_move = app.board.turn();
+    let running = app.clock.is_running() && !app.game_over();
+    let flagged = app.clock.flagged();
+
+    let width = ui.available_width();
+    let gap = ui.spacing().item_spacing.x;
+    let clock_width = (width - gap * 2.0 - BUTTON_WIDTH) / 2.0;
+
+    ui.horizontal(|ui| {
+        for side in Color::BOTH {
+            let remaining = app.clock.remaining_now(side);
+            // the side on the clock is the one burning it, so it is the one to read
+            let color = if flagged == Some(side) {
+                DANGER
+            } else if running && side == to_move {
+                CALM
+            } else {
+                TEXT_MUTED
+            };
+
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(clock_width, 52.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 6.0, PANEL_BG);
+            ui.painter().rect_stroke(
+                rect,
+                6.0,
+                egui::Stroke::new(1.0, PANEL_BORDER),
+                egui::StrokeKind::Inside,
+            );
+
+            let name = match side {
+                Color::White => "WHITE",
+                Color::Black => "BLACK",
+            };
+            ui.painter().text(
+                rect.left_top() + egui::vec2(10.0, 8.0),
+                egui::Align2::LEFT_TOP,
+                name,
+                egui::FontId::proportional(11.0),
+                TEXT_MUTED,
+            );
+            ui.painter().text(
+                rect.left_bottom() + egui::vec2(10.0, -8.0),
+                egui::Align2::LEFT_BOTTOM,
+                format_remaining(remaining),
+                egui::FontId::monospace(24.0),
+                color,
+            );
+        }
+
+        let (text, text_color) = match (app.game_over(), running) {
+            (true, _) => ("Game over", TEXT_MUTED),
+            (false, true) => ("Pause", CALM),
+            (false, false) => ("Start", ACCENT),
+        };
+        if panel_button(ui, text, text_color, egui::vec2(BUTTON_WIDTH, 52.0)) {
+            app.toggle_clock();
+        }
+    });
+
+    ui.add_space(16.0);
+}
+
 // whose move it is, as a disc in that side's colour next to its name - once the
 // game has ended this shows the result instead, under the same heading
 fn turn_block(app: &ChessApp, ui: &mut egui::Ui) {
-    let (name, disc) = if app.board.is_checkmate() {
+    let (name, disc) = if let Some(flagged) = app.clock.flagged() {
+        // a flag decides the game before the position does, whatever stands on the board
+        match flagged {
+            Color::White => ("Black won on time", BLACK_SIDE),
+            Color::Black => ("White won on time", WHITE_SIDE),
+        }
+    } else if app.board.is_checkmate() {
         match app.board.winner() {
             Color::White => ("White won", WHITE_SIDE),
             Color::Black => ("Black won", BLACK_SIDE),
@@ -198,18 +280,26 @@ fn search_blocks(app: &ChessApp, ui: &mut egui::Ui) {
     // a book move was not searched for, so it has no depth and no score to show, and
     // the counts below it are all zero because nothing was done to run them up
     let heading = if stats.from_book {
-        "BOOK MOVE".to_string()
+        "BOOK MOVE"
     } else {
-        format!("BEST MOVE AT DEPTH {}", stats.depth)
+        "BEST MOVE"
     };
     let score = if stats.from_book {
         "-".to_string()
     } else {
         format_score(stats.score)
     };
+    // the deepest pass that finished. Under a time limit this is a result rather than a
+    // setting - how far the engine got for what it was given - so it gets its own line
+    let depth = if stats.from_book {
+        "-".to_string()
+    } else {
+        stats.depth.to_string()
+    };
 
-    stat_block(ui, &heading, &best_move, ACCENT);
+    stat_block(ui, heading, &best_move, ACCENT);
     stat_block(ui, "SCORE (WHITE)", &score, STAT_EVAL);
+    stat_block(ui, "DEPTH REACHED", &depth, ACCENT);
     stat_block(
         ui,
         "POSITIONS SEARCHED",
@@ -228,6 +318,11 @@ fn search_blocks(app: &ChessApp, ui: &mut egui::Ui) {
         &format_duration(stats.duration),
         STAT_TIME,
     );
+    // what the last move the engine played was given, to read the time taken against -
+    // a search that lands well short of its budget is one that ran out of depth first
+    if let Some(budget) = app.last_budget {
+        stat_block(ui, "TIME BUDGET", &format_duration(budget), STAT_TIME);
+    }
     stat_block(
         ui,
         "POSITIONS / SEC",
@@ -388,6 +483,8 @@ fn testing_blocks(app: &mut ChessApp, ui: &mut egui::Ui) {
         app.analyse_once();
     }
     ui.add_space(6.0);
+
+    time_control_block(app, ui, full_width);
 
     // hands the position to the bundled Stockfish and shows its top answers below,
     // for checking this engine's move choices against a much stronger one
@@ -603,6 +700,127 @@ fn autoplay_buttons(app: &mut ChessApp, ui: &mut egui::Ui, size: egui::Vec2) {
     if panel_button(ui, label, color, size) {
         app.autoplay_black = !app.autoplay_black;
     }
+}
+
+// what bounds a move the engine plays: the depth field above, a flat time per move, or
+// a clock for the whole game. Changing any of it starts the clocks over, so a control is
+// picked before a game rather than in the middle of one
+fn time_control_block(app: &mut ChessApp, ui: &mut egui::Ui, full_width: f32) {
+    label(ui, "TIME CONTROL");
+    ui.add_space(4.0);
+
+    let gap = ui.spacing().item_spacing.x;
+    let third = (full_width - gap * 2.0) / 3.0;
+
+    // what a click on each mode would switch to, built from the fields as they stand
+    let modes = [
+        ("Depth", TimeControl::Depth),
+        (
+            "Per move",
+            TimeControl::MoveTime(Duration::from_secs(app.move_seconds.max(1))),
+        ),
+        (
+            "Clock",
+            TimeControl::clock(app.clock_minutes.max(1), app.clock_increment),
+        ),
+    ];
+
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        for (name, control) in modes {
+            // the mode it is in now, the same way the toggles above read
+            let color = if same_mode(app.time_control, control) {
+                CALM
+            } else {
+                TEXT_MUTED
+            };
+            if panel_button(ui, name, color, egui::vec2(third, 30.0)) {
+                picked = Some(control);
+            }
+        }
+    });
+
+    // the numbers behind the mode in force; the other modes' fields stay as they were
+    match app.time_control {
+        TimeControl::Depth => {}
+        TimeControl::MoveTime(_) => {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [third, 30.0],
+                    egui::DragValue::new(&mut app.move_seconds)
+                        .range(1..=600)
+                        .suffix(" s"),
+                );
+                ui.label(
+                    egui::RichText::new("per move")
+                        .size(13.0)
+                        .color(TEXT_MUTED),
+                );
+            });
+            picked = picked.or(Some(TimeControl::MoveTime(Duration::from_secs(
+                app.move_seconds.max(1),
+            ))));
+        }
+        TimeControl::Clock { .. } => {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [third, 30.0],
+                    egui::DragValue::new(&mut app.clock_minutes)
+                        .range(1..=180)
+                        .suffix(" min"),
+                );
+                ui.add_sized(
+                    [third, 30.0],
+                    egui::DragValue::new(&mut app.clock_increment)
+                        .range(0..=60)
+                        .suffix(" s"),
+                );
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                for (name, minutes, increment) in TimeControl::PRESETS {
+                    let preset = TimeControl::clock(minutes, increment);
+                    let color = if app.time_control == preset {
+                        CALM
+                    } else {
+                        TEXT_MUTED
+                    };
+                    if panel_button(ui, name, color, egui::vec2(third * 0.6, 26.0)) {
+                        app.clock_minutes = minutes;
+                        app.clock_increment = increment;
+                        picked = Some(preset);
+                    }
+                }
+            });
+
+            picked = picked.or(Some(TimeControl::clock(
+                app.clock_minutes.max(1),
+                app.clock_increment,
+            )));
+        }
+    }
+
+    // set_time_control does nothing when the control has not actually changed, so the
+    // dragged fields above can hand it a control every frame
+    if let Some(control) = picked {
+        app.set_time_control(control);
+    }
+
+    ui.add_space(6.0);
+}
+
+// whether two controls are the same kind, regardless of the numbers in them - which is
+// what the mode buttons highlight
+fn same_mode(left: TimeControl, right: TimeControl) -> bool {
+    matches!(
+        (left, right),
+        (TimeControl::Depth, TimeControl::Depth)
+            | (TimeControl::MoveTime(_), TimeControl::MoveTime(_))
+            | (TimeControl::Clock { .. }, TimeControl::Clock { .. })
+    )
 }
 
 // perft: counts positions at a given depth, checked against published numbers

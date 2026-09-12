@@ -10,6 +10,7 @@ use crate::board::square::{
     bit, en_passant_captured_square, file_of, offset, rank_of, square_from_name, square_name,
 };
 use crate::board::zobrist::ZOBRIST;
+use crate::evaluate::incremental_score;
 
 // cloned to put a position aside and come back to it later, history and all - the
 // GUI stores test positions that way
@@ -27,6 +28,7 @@ pub struct Board {
     hash: u64,
     en_passant_hash: u64,
     phase: i32,
+    psqt: i32,
 }
 
 // -------------------- setting up --------------------
@@ -49,6 +51,7 @@ impl Board {
             en_passant_hash: 0,
             // an empty board has nothing standing on it
             phase: 0,
+            psqt: 0,
         }
     }
 
@@ -120,6 +123,13 @@ impl Board {
     // the raw count, so a promotion can push it past a full board
     pub fn phase(&self) -> i32 {
         self.phase
+    }
+
+    // the material and piece square total of everything but the kings and pawns, from
+    // white's side. Phase free, so it is carried along with the move rather than summed
+    // up again at every leaf
+    pub fn psqt(&self) -> i32 {
+        self.psqt
     }
 
     // the squares holding that piece type and color, as one number per square bit
@@ -249,6 +259,7 @@ impl Board {
 
         debug_assert_eq!(self.hash, self.full_hash(), "incremental hash drifted");
         debug_assert_eq!(self.phase, self.counted_phase(), "phase drifted");
+        debug_assert_eq!(self.psqt, self.counted_psqt(), "psqt drifted");
         debug_assert_eq!(self.pieces, self.counted_pieces(), "bitboards drifted");
         debug_assert_eq!(self.occupied, self.counted_occupied(), "occupancy drifted");
         debug_assert_eq!(
@@ -305,6 +316,7 @@ impl Board {
 
         debug_assert_eq!(self.hash, self.full_hash(), "incremental hash drifted");
         debug_assert_eq!(self.phase, self.counted_phase(), "phase drifted");
+        debug_assert_eq!(self.psqt, self.counted_psqt(), "psqt drifted");
         debug_assert_eq!(self.pieces, self.counted_pieces(), "bitboards drifted");
         debug_assert_eq!(self.occupied, self.counted_occupied(), "occupancy drifted");
         debug_assert_eq!(
@@ -707,6 +719,7 @@ impl Board {
             self.hash ^= ZOBRIST.piece(square, previous);
             // no guard needed here: this counts what is standing, not where it stands
             self.phase -= previous.piece_type().phase_weight();
+            self.psqt -= incremental_score(previous, square);
 
             // xor both ways round, for the same reason the hash above may: a square
             // holds one piece, and the old one always comes off before a new one goes on
@@ -717,6 +730,7 @@ impl Board {
         if let Some(piece) = piece {
             self.hash ^= ZOBRIST.piece(square, piece);
             self.phase += piece.piece_type().phase_weight();
+            self.psqt += incremental_score(piece, square);
 
             self.pieces[piece.color().index()][piece.piece_type().board_index()] ^= bit(square);
             self.occupied[piece.color().index()] ^= bit(square);
@@ -798,6 +812,16 @@ impl Board {
             .iter()
             .flatten()
             .map(|piece| piece.piece_type().phase_weight())
+            .sum()
+    }
+
+    // the same from scratch pass for the piece square total
+    fn counted_psqt(&self) -> i32 {
+        self.squares
+            .iter()
+            .enumerate()
+            .filter_map(|(square, occupant)| Some((square, (*occupant)?)))
+            .map(|(square, piece)| incremental_score(piece, square as u8))
             .sum()
     }
 

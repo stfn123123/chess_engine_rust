@@ -10,6 +10,13 @@ whether it found one of its top 5 - plus how close the evals are, then
 saves a PNG summary of the run under benchmark_results/, including a
 per-position table of id, game phase, and which of those tiers it hit.
 
+Every position can be searched either to a fixed depth or for a fixed time,
+asked for when the script starts. Fixed time is the honest way to compare
+two versions of the engine: at a fixed depth a change that searches fewer
+nodes per ply looks identical to one that searches them faster. Under a
+time limit the depth reached becomes a result in its own right, so it is
+reported per position and averaged.
+
 Usage:
     scripts/.venv/bin/python3 scripts/benchmark.py
 
@@ -36,6 +43,14 @@ MATE_CENTIPAWN_CAP = 3000
 # matches search.rs's MATE_BOUND (MATE - 1_000, with MATE = 100_000) - the
 # score threshold above which the engine's own result is a proven mate
 ENGINE_MATE_BOUND = 99_000
+
+# matches search.rs's MAX_SEARCH_DEPTH: under a time limit the depth is only a
+# ceiling, and this is the highest the engine will deepen towards
+MAX_SEARCH_DEPTH = 64
+
+# how long a position may take beyond its own budget before the run gives up on
+# it - covers process startup and a search overrunning its deadline
+TIMEOUT_SLACK_SECONDS = 60
 
 # # basis for a future "which positions to run" filter, keyed off each
 # # position's "phase" field (0.0 bare kings, 1.0 a full board) - not wired
@@ -129,12 +144,14 @@ def load_library(path):
 #     raise ValueError(f"unknown filter choice {choice!r}")
 
 
-def run_engine(fen, depth, table_megabytes):
+def run_engine(fen, depth, table_megabytes, time_ms):
+    # time_ms of 0 means no time limit, in which case depth is what bounds the
+    # search; with a time given, depth is only a ceiling
     result = subprocess.run(
-        [str(BINARY), "eval-fen", fen, str(depth), str(table_megabytes)],
+        [str(BINARY), "eval-fen", fen, str(depth), str(table_megabytes), str(time_ms)],
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=time_ms / 1000 + TIMEOUT_SLACK_SECONDS,
     )
     line = result.stdout.strip()
     if not line:
@@ -147,6 +164,7 @@ def run_engine(fen, depth, table_megabytes):
     return {
         "bestmove": fields["bestmove"],
         "score": int(fields["score"]),
+        "depth": int(fields["depth"]),
         "nodes": int(fields["nodes"]),
         "time_ms": int(fields["time_ms"]),
     }
@@ -167,9 +185,10 @@ STATUS_COLORS = {
 }
 
 
-def render_png(*, run_name, depth, table_megabytes, library_path, total, evaluated,
-                top5_accuracy, top2_accuracy, best_accuracy, avg_eval_diff, total_nodes,
-                elapsed, nps, positions_detail):
+def render_png(*, run_name, limit_label, avg_depth, depth_range, table_megabytes,
+                library_path, total, evaluated, top5_accuracy, top2_accuracy,
+                best_accuracy, avg_eval_diff, total_nodes, elapsed, nps,
+                positions_detail):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -198,7 +217,7 @@ def render_png(*, run_name, depth, table_megabytes, library_path, total, evaluat
     )
 
     hyperparameters = (
-        f"search depth: {depth}\n"
+        f"search limit: {limit_label}\n"
         f"table size: {table_megabytes} MB\n"
         f"positions file: {library_path.name}\n"
         f"positions evaluated: {evaluated}/{total}"
@@ -206,21 +225,23 @@ def render_png(*, run_name, depth, table_megabytes, library_path, total, evaluat
     ax.text(0.05, 0.88, hyperparameters, fontsize=11, va="top", family="monospace",
             transform=ax.transAxes)
 
+    low, high = depth_range
     stats = [
         ("Best-move accuracy", f"{best_accuracy:.1f}%"),
         ("Top-2 accuracy", f"{top2_accuracy:.1f}%"),
         ("Top-5 accuracy", f"{top5_accuracy:.1f}%"),
         ("Avg eval diff", f"{avg_eval_diff:.0f} cp"),
+        ("Depth reached", f"{avg_depth:.1f} ({low}-{high})"),
         ("Nodes searched", f"{total_nodes:,}"),
         ("Total time", f"{elapsed:.1f} s"),
         ("Nodes/sec", f"{nps:,.0f}"),
     ]
 
-    y = 0.60
+    y = 0.62
     for label, value in stats:
         ax.text(0.05, y, label, fontsize=13, transform=ax.transAxes)
         ax.text(0.95, y, value, fontsize=13, ha="right", fontweight="bold", transform=ax.transAxes)
-        y -= 0.085
+        y -= 0.075
 
     if positions_detail:
         ax_table = fig.add_axes([0.02, 0.02, 0.96, table_height / fig_height - 0.02])
@@ -239,15 +260,20 @@ def render_png(*, run_name, depth, table_megabytes, library_path, total, evaluat
             for chunk in chunks:
                 if row < len(chunk):
                     entry = chunk[row]
-                    row_text += [str(entry["id"]), f"{entry['phase']:.2f}", entry["status"]]
-                    row_colors += ["white", "white", STATUS_COLORS[entry["status"]]]
+                    row_text += [
+                        str(entry["id"]),
+                        f"{entry['phase']:.2f}",
+                        str(entry["depth"]),
+                        entry["status"],
+                    ]
+                    row_colors += ["white", "white", "white", STATUS_COLORS[entry["status"]]]
                 else:
-                    row_text += ["", "", ""]
-                    row_colors += ["white", "white", "white"]
+                    row_text += ["", "", "", ""]
+                    row_colors += ["white", "white", "white", "white"]
             cell_text.append(row_text)
             cell_colors.append(row_colors)
 
-        col_labels = ["ID", "Phase", "Result"] * n_groups
+        col_labels = ["ID", "Phase", "Depth", "Result"] * n_groups
         table = ax_table.table(
             cellText=cell_text,
             colLabels=col_labels,
@@ -268,7 +294,19 @@ def render_png(*, run_name, depth, table_megabytes, library_path, total, evaluat
 def main():
     print("=== Engine vs. Stockfish benchmark ===\n")
 
-    depth = ask_int("Search depth", 6)
+    # a fixed depth measures what the engine finds; a fixed time measures what it
+    # finds for the money, which is what comparing two versions wants
+    mode = ask_str("Limit by (d)epth or (t)ime", default="d").lower()
+    if mode.startswith("t"):
+        seconds = ask_int("Seconds per position", 30)
+        time_ms = seconds * 1000
+        depth = MAX_SEARCH_DEPTH
+        limit_label = f"{seconds} s / position"
+    else:
+        time_ms = 0
+        depth = ask_int("Search depth", 6)
+        limit_label = f"depth {depth}"
+
     run_name = ask_str("Run name", required=True)
     library_path = Path(ask_str("Positions library file", default=str(DEFAULT_LIBRARY)))
     table_megabytes = ask_int("Transposition table size (MB)", 64)
@@ -303,17 +341,23 @@ def main():
     top2_hits = 0
     top5_hits = 0
     eval_diffs = []
+    depths = []
     total_nodes = 0
     positions_detail = []
 
-    print(f"\nevaluating {total} positions at depth {depth}...\n")
+    print(f"\nevaluating {total} positions at {limit_label}...")
+    if time_ms:
+        # the whole run is priced up front under a time limit, unlike a depth
+        print(f"that is about {total * time_ms / 1000 / 60:.0f} minutes\n")
+    else:
+        print()
     started = time.time()
 
     for index, position in enumerate(positions, start=1):
         print(f"[{index}/{total}] evaluating...", end=" ", flush=True)
 
         try:
-            result = run_engine(position["fen"], depth, table_megabytes)
+            result = run_engine(position["fen"], depth, table_megabytes, time_ms)
         except Exception as error:
             print(f"ERROR: {error}")
             continue
@@ -333,11 +377,20 @@ def main():
             engine_score_to_centipawns(result["score"]) - eval_to_centipawns(position["eval"])
         )
         eval_diffs.append(diff)
+        depths.append(result["depth"])
         total_nodes += result["nodes"]
 
         status = "BEST" if is_best else ("TOP2" if is_top2 else ("TOP5" if is_top5 else "MISS"))
-        positions_detail.append({"id": position["id"], "status": status, "phase": position["phase"]})
-        print(f"{engine_move:>6} vs {best_move or '?':>6} [{status:>4}] eval diff {diff:5d}cp")
+        positions_detail.append({
+            "id": position["id"],
+            "status": status,
+            "phase": position["phase"],
+            "depth": result["depth"],
+        })
+        print(
+            f"{engine_move:>6} vs {best_move or '?':>6} [{status:>4}]"
+            f" d{result['depth']:<2} eval diff {diff:5d}cp"
+        )
 
     elapsed = time.time() - started
     evaluated = len(eval_diffs)
@@ -350,6 +403,7 @@ def main():
     top2_accuracy = 100 * top2_hits / evaluated
     best_accuracy = 100 * best_hits / evaluated
     avg_eval_diff = statistics.mean(eval_diffs)
+    avg_depth = statistics.mean(depths)
     nps = total_nodes / elapsed if elapsed > 0 else 0
 
     print("\n=== Results ===")
@@ -358,13 +412,16 @@ def main():
     print(f"top-2 accuracy:       {top2_accuracy:.1f}%")
     print(f"top-5 accuracy:       {top5_accuracy:.1f}%")
     print(f"avg eval diff:        {avg_eval_diff:.0f} cp")
+    print(f"depth reached:        {avg_depth:.1f} avg ({min(depths)}-{max(depths)})")
     print(f"nodes searched:       {total_nodes:,}")
     print(f"total time:           {elapsed:.1f} s")
     print(f"nodes/sec:            {nps:,.0f}")
 
     output_path = render_png(
         run_name=run_name,
-        depth=depth,
+        limit_label=limit_label,
+        avg_depth=avg_depth,
+        depth_range=(min(depths), max(depths)),
         table_megabytes=table_megabytes,
         library_path=library_path,
         total=total,

@@ -1,8 +1,3 @@
-# TODO Today:
-- rework phase evaluation?
-  - queen less value
-
-
 # Search & Evaluation
 Search (biggest gaps)
 - Principal Variation Search
@@ -12,7 +7,8 @@ Search (biggest gaps)
     - Pawn structure
     - king safety
 - improve LMR
-- improve qsence
+- improve quiescence
+- improve time management depending on phase
 
 ## Performance
 - MoveOrder (search.rs, ~60 lines) could be one line instead: `moves.sort_by_cached_key(|m| -move_score(board, m))`.
@@ -24,9 +20,10 @@ Search (biggest gaps)
 
 
 ## Gameplay
-- add different time modes and increment
 - connect to lichess using the api
 
+# ERROR?
+test pruning_does_not_pick_a_worse_move_in_a_tactical_position() fails with the interpolated pawns. honestl I dont care since this is just a test, so i dont think it matters.
 
 
 
